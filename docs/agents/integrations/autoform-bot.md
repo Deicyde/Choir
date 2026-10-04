@@ -5,9 +5,17 @@ formalization as a Markdown blueprint and proves it with local agents. On
 Choir it plans and writes statements on the overseer's machine and proves on
 contributors' machines, and Choir carries every task between them. Use
 AutoformBot's skills as they are; this note covers only where the two tools
-meet. Its worker and specialist agents ship with its `execution` overlay.
+meet.
 
-`$AUTOFORM` is AutoformBot's plugin root. Its CLI runs as
+The blueprint is more than a plan to read from. AutoformBot derives what is
+ready and what is finished from the articles and nothing else, so an article
+has to say what is true of the code after every merge. On Choir you write the
+articles and contributors write the proofs, which is why this note has you
+check the one against the other each pass.
+
+`$AUTOFORM` is a clone of AutoformBot's `execution` branch, which is where its
+worker and specialist agents are. An installed plugin's directory is not a
+checkout and will not do. Its CLI runs as
 `uv run --project "$AUTOFORM" autoform …` from the project checkout.
 
 ## Overseer
@@ -15,19 +23,25 @@ meet. Its worker and specialist agents ship with its `execution` overlay.
 ### Setup
 
 After Choir's bootstrap, add AutoformBot's layer with `autoform init`, as its
-`setup` skill says. Then:
+`setup` skill says. Then, before you push:
 
 - Add `site/`, `site-src/` and `*.log` to `.gitignore`; `init` leaves Choir's
   alone.
-- **Delete the `pull_request:` trigger from `autoform-verify.yml` and
-  `blueprint-pages.yml` before you push.** The audit rejects `sorryAx`, which a
-  Choir project always holds for its open tasks, and the Pages `deploy` job is
-  skipped on pull requests. The merge preflight treats any check it doesn't
-  recognise as blocking until it succeeds, so either would block every merge.
-- **Never create a `roadmap/` directory at the project root.** AutoformBot
-  rejects a directory holding both `roadmap/` and `blueprint/roadmap/`, so its
-  tools stop working there and in every workspace pinned to such a commit.
-  Keep your reasoning log in `reasoning-log.md` instead.
+- **Delete what `init` wrote under `.github/`:** `autoform-verify.yml`,
+  `blueprint-pages.yml` and `autoform_audit.py`. The audit rejects `sorryAx`,
+  which a Choir project holds for every open task, so it is red on pull
+  requests and on every push to the default branch alike. Publishing the
+  blueprint to Pages is the overseer's decision, and not one to make by
+  pushing a workflow.
+- **Protect the blueprint.** Add to `.choir/verify.toml`:
+
+      [protected]
+      paths = ["blueprint/"]
+
+  The merge preflight then refuses a pull request that edits an article.
+- **Keep one plan.** Do not keep a root `roadmap/` as well: AutoformBot's
+  commands that take the project root refuse a tree holding both. Keep your
+  reasoning log in `reasoning-log.md`.
 
 ### The plan
 
@@ -47,13 +61,16 @@ and push. Don't run AutoformBot's proof phase on work you publish.
 
 ### Publishing
 
-A node is ready when AutoformBot reports it `can_prove` and not yet proved:
+A node is ready when AutoformBot reports it `can_prove` and not yet proved.
+That is stricter than Choir's default, which publishes a node once what it
+depends on is stated: here a node waits until its proof dependencies are
+proved.
 
 ```bash
 uv run --project "$AUTOFORM" python - <<'EOF'
 import json
 from autoform_cli.runtime import load_runtime_graph
-graph = load_runtime_graph(".", lean_root=".")
+graph = load_runtime_graph("blueprint", lean_root=".")
 for node in graph.nodes:
     if (node.dispatchable and node.status.can_prove and not node.status.proved
             and not node.assertions.not_ready):
@@ -62,36 +79,69 @@ for node in graph.nodes:
 EOF
 ```
 
-Skip a node with an open task (`choir orch tasks --state open` shows each
-task's `blueprint_ref`). Publish one task per declaration still holding a
-placeholder: `--target-file` and `--target-decl` from `targets`,
-`--blueprint-ref` set to the node id, and the article's path in `--prose`.
-Then set `discussion: <issue number>` on the article; it follows the article if
-the article moves, which the path-derived node id doesn't.
+Publish one task per declaration still holding a placeholder:
+`--target-file` and `--target-decl` from `targets`, `--blueprint-ref` set to
+the node id, and the article's path in `--prose`. `create-task` refuses a
+declaration that already has an open task, so running this again is safe.
+Then set `discussion: <issue number>` on the article; it follows the article
+if the article moves, which the path-derived node id doesn't.
 
 ### The loop
 
-- **Each pass:** `autoform check blueprint --lean-root .` and
-  `autoform audit blueprint --lean-root .` replace `sync-graph`.
-- **Review:** use AutoformBot's `agent-review` rubrics in § Stage two.
+- **Each pass:** `autoform check blueprint --lean-root .`, then hold the
+  blueprint to the build. This replaces `sync-graph`:
+
+  ```bash
+  uv run --project "$AUTOFORM" python - <<'EOF' | choir orch check-plan . --plan -
+  import json
+  from autoform_cli.runtime import load_runtime_graph
+  graph = load_runtime_graph("blueprint", lean_root=".")
+  print(json.dumps({"nodes": [
+      {"id": n.id, "decls": [t.declaration for t in n.lean_targets],
+       "stated": n.status.stated, "proved": n.status.proved,
+       "uses": list(n.statement_dependencies),
+       "proof_uses": list(n.proof_dependencies)}
+      for n in graph.nodes if n.formalizable and not n.mathlib]}))
+  EOF
+  ```
+
+  `autoform check` and `autoform audit` read the articles and trust them;
+  this reads the build. Every finding is an article to correct or a merge to
+  look at again (`integrations/README.md` § Holding a plan to the build).
+- **Review:** use AutoformBot's `agent-review` rubrics in § Stage two, on the
+  diff. For what the rubrics ask you to compile or probe, cite the gate's
+  `rebuild`, `comparator` and `trust-report` on that head commit; don't build
+  a contributor's tree on this machine. Run `autoform skeleton` on the
+  default branch after the merge.
 - **After a merge:** set `proof: formalized` once every declaration the article
-  names is proved, then publish what became ready.
+  names is proved, then publish what became ready. Until you do, `check-plan`
+  reports the node as `proof-not-recorded`.
+- **After you change an article that has an open task:** a workspace holds the
+  blueprint at the task's pin, so move the pin with
+  `choir orch edit-task <n> --commit <sha>`. It refuses while the task is
+  claimed.
 - **A reduction:** each child becomes an article beside its parent
-  (`origin: bridged`, `statement: formalized`, `lean: <child>`), linked from
-  the parent's `## Proof depends on`. A worker wrote these statements, so run
+  (`declaration:`, `origin: bridged`, `statement: formalized`, `lean: <child>`,
+  its statement, and a `## Depends on` section), linked from the parent's
+  `## Proof depends on`. Until then `check-plan` reports the child as an
+  `unplanned-placeholder`. A worker wrote these statements, so run
   `content-reviewer` on each before you accept.
 
 ## Contributor
 
 In § 3. Prove it, hand the task to AutoformBot's `autoform-worker` agent and
-act as its parent:
+act as its parent. Don't run its `orchestrate` skill here: that picks and
+claims nodes itself.
 
 - **Project:** `prepared.path`. **Article:** the path `TASK.md` names.
-  **Target:** `target_file` and `target_decl` from `prepared.record`.
+  **Target:** `target_file` and `target_decl` from `prepared.record`. Have it
+  read `.choir-context.md`, `CHOIR.md` and `TASK.md` first.
 - **Claim:** your Choir lease. Don't run `autoform claim` or take its
-  `lake-build` claim; `choir worker heartbeat` is the renewal it expects.
+  `lake-build` claim; `choir worker heartbeat` is the renewal it expects. It
+  says the parent "releases the node claim on every outcome"; that is not
+  `choir worker release`, which gives the task up.
 - **Tell it:** edit only the target file, not the article, and never touch a
-  statement.
+  statement. You commit and run `choir worker submit`; it does neither.
 
 Its `PROVED` or `FAILED` report is the report § 3 asks for. A refutation from
 `counterexample-hunter` is a "this statement is wrong" `choir-defect`.
