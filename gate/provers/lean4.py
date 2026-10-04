@@ -616,7 +616,7 @@ def parse_lean_trust_report(output: str) -> list[TrustEntry]:
 # marker prefix is what lets the parser ignore build noise, warnings and
 # blank lines the way `parse_lean_trust_report` does.
 #
-# Three details in the probe body are load-bearing:
+# Four details in the probe body are load-bearing:
 #
 #   * `ConstantInfo.value?` is `None` for an imported theorem, so a
 #     proof's dependencies must be read through `getUsedConstantsAsSet`
@@ -629,6 +629,15 @@ def parse_lean_trust_report(output: str) -> list[TrustEntry]:
 #     (congruence lemmas, equation lemmas). `findDeclarationRanges?`
 #     separates them: a declaration the source declares has a range, and
 #     the generated ones do not.
+#   * Lean compiles recursion on several arguments, mutual recursion and
+#     a proof nested inside a definition through auxiliaries the source
+#     never names (`f._unary`, `f._mutual`, `f._proof_1`). They are
+#     internal detail, so they are not reported and nothing has an edge
+#     to them, and the written declaration's own term stops at them. The
+#     traversal therefore walks on through an internal-detail constant
+#     of the project's own modules. Stopping there read a `sorry` in a
+#     termination proof as no placeholder and dropped every lemma a
+#     mutual proof used.
 #
 # It enumerates the project's own modules out of the environment header
 # rather than filtering the whole constant map. Both answer the same
@@ -671,7 +680,19 @@ _DEPENDENCY_PROBE_BODY = r"""open Lean in
         | _ => "definition"
       let inType : NameSet :=
         ci.type.getUsedConstants.foldl (fun s m => s.insert (user m)) {}
-      let every := ci.getUsedConstantsAsSet.toList
+      let mut all : NameSet := {}
+      let mut todo := ci.getUsedConstantsAsSet.toList
+      while !todo.isEmpty do
+        let m := todo.head!
+        todo := todo.tail!
+        if all.contains m then continue
+        all := all.insert m
+        if (user m).isInternalDetail then
+          if let some j := env.getModuleIdxFor? m then
+            if project.contains modules[j.toNat]! then
+              if let some aux := env.find? m then
+                todo := aux.getUsedConstantsAsSet.toList ++ todo
+      let every := all.toList
       let reached : NameSet := every.foldl
         (fun s m => if declared.contains (user m) then s.insert (user m) else s) {}
       let named := reached.toList.filter (fun m => m != self)

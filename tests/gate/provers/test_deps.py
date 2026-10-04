@@ -182,6 +182,22 @@ private theorem helper : w = 1 := rfl
 theorem main : w = 1 := helper
 
 theorem open_goal : w = 2 := sorry
+
+def two_args (a b : Nat) : Nat :=
+  if b = 0 then a else two_args b (a % b)
+termination_by b
+decreasing_by sorry
+
+mutual
+theorem step_a : (n : Nat) → w = 2
+  | 0 => open_goal
+  | n + 1 => step_b n
+termination_by n => n
+theorem step_b : (n : Nat) → w = 2
+  | 0 => open_goal
+  | n + 1 => step_a n
+termination_by n => n
+end
 """
 
 
@@ -218,7 +234,9 @@ def test_live_lean4_dependency_probe(tmp_path: Path) -> None:
 
     # Exactly what the source declares: a generated congruence or equation
     # lemma would show up here, and must not.
-    assert set(found) == {"w", "helper", "main", "open_goal"}
+    assert set(found) == {
+        "w", "helper", "main", "open_goal", "two_args", "step_a", "step_b",
+    }
 
     # A private helper arrives unmangled, at both ends of its edge.
     assert found["main"].proof_uses == ("helper",)
@@ -245,5 +263,15 @@ def test_live_lean4_dependency_probe(tmp_path: Path) -> None:
 
     assert found["open_goal"].has_placeholder is True
     assert found["main"].has_placeholder is False
+
+    # Lean compiles recursion on several arguments and mutual recursion
+    # through auxiliaries the source never names (`two_args._unary`,
+    # `step_a._mutual`). What sits behind one belongs to the declaration
+    # that was written: a placeholder there is its placeholder, and a lemma
+    # used there is one it uses.
+    assert found["two_args"].has_placeholder is True
+    assert "open_goal" in found["step_a"].proof_uses
+    assert "open_goal" in found["step_b"].proof_uses
+    assert found["step_a"].has_placeholder is False
     assert found["main"].module == "DepProbe"
     assert found["w"].kind == "definition" and found["main"].kind == "theorem"
