@@ -16,18 +16,22 @@ non-zero is reserved for producing no answer at all.
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import orchestrator.graph.probe as probe_mod
 from gate.checks import REQUIRED_PRESENT
+from gate.provers.base import DeclDependency
 from gate.state.intake import ParseSuccess, parse_issue_body
 from gate.state.lease_comment import ACTION_CLAIM, LeaseClaim, render_lease_comment
 from gate.state.task_record import ProjectRef, TaskRecord, TaskType
 from orchestrator import cli as cli_mod
 from orchestrator import leases as leases_mod
 from orchestrator import prs as prs_mod
+from orchestrator.graph import GraphSyncError
 from orchestrator.prs import CheckResult, PRError, PRView
 from orchestrator.tasks import api as tasks_api
 from orchestrator.tasks.serialize import task_to_body
@@ -208,6 +212,109 @@ def test_viz_reports_an_unreadable_folder_as_bad_arguments(monkeypatch, capsys) 
     monkeypatch.setattr(cli_mod, "_viz_report", _fake)
     assert cli_mod.main(["viz"]) == 1
     assert "not a git checkout" in capsys.readouterr().err
+
+
+# ---------------------------------------------- a plan kept another way
+#
+# These run the real comparison with only the prover stubbed out, so what
+# they pin is the command's contract: a checkout path and no `--repo`, a
+# disagreement as an answer, and exit 1 only when no answer was produced.
+
+
+def _built_checkout(tmp_path, monkeypatch, *, placeholder: bool):  # type: ignore[no-untyped-def]
+    """A source tree with no `roadmap/graph.json`, and a prover that says
+    its one declaration does or does not hold a placeholder."""
+    (tmp_path / "Proj.lean").write_text("theorem main : True := trivial\n")
+    monkeypatch.setattr(probe_mod, "read_prover", lambda c: "lean4")
+    monkeypatch.setattr(probe_mod, "require_built", lambda c, p: None)
+    monkeypatch.setattr(
+        probe_mod, "collect_dependencies",
+        lambda profile, ws, imports: [DeclDependency(
+            decl="Proj.main", kind="theorem", module="Proj", line=1,
+            has_placeholder=placeholder, uses=(), proof_uses=(),
+        )],
+    )
+    return tmp_path
+
+
+def _claims_file(tmp_path, text: str) -> str:  # type: ignore[no-untyped-def]
+    path = tmp_path / "claims.json"
+    path.write_text(text)
+    return str(path)
+
+
+_PROVED = json.dumps({"nodes": [{
+    "id": "main", "decls": ["Proj.main"], "stated": True, "proved": True,
+    "uses": [], "proof_uses": [],
+}]})
+
+
+def test_a_plan_the_build_contradicts_exits_zero_and_says_so(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Drift is what the command exists to find. Exiting non-zero on it
+    would make the routine answer indistinguishable from a broken run."""
+    checkout = _built_checkout(tmp_path, monkeypatch, placeholder=True)
+
+    rc = cli_mod.main(["check-plan", str(checkout), "--plan", _claims_file(tmp_path, _PROVED)])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["agrees"] is False
+    assert [(f["code"], f["node"], f["decl"]) for f in out["findings"]] == [
+        ("proof-claimed-over-placeholder", "main", "Proj.main")
+    ]
+
+
+def test_a_plan_the_build_bears_out_agrees(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    checkout = _built_checkout(tmp_path, monkeypatch, placeholder=False)
+
+    rc = cli_mod.main(["check-plan", str(checkout), "--plan", _claims_file(tmp_path, _PROVED)])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == {"agrees": True, "findings": [], "helpers": []}
+
+
+def test_malformed_plan_claims_are_bad_arguments(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Nothing was compared, so there is no answer to print — and an
+    empty `findings` here would read as the plan agreeing."""
+    checkout = _built_checkout(tmp_path, monkeypatch, placeholder=False)
+    plan = _claims_file(tmp_path, json.dumps({"nodes": [{"id": "main", "decls": ["Proj.main"]}]}))
+
+    rc = cli_mod.main(["check-plan", str(checkout), "--plan", plan])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "stated" in captured.err
+
+
+@pytest.mark.parametrize("argv", [["deps"], ["check-plan", "--plan", "-"]])
+def test_an_unbuilt_checkout_gets_no_answer(argv, tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Stale artifacts would be compared without complaint, and the
+    findings would blame the plan for the build being behind."""
+    checkout = _built_checkout(tmp_path, monkeypatch, placeholder=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_PROVED))
+
+    def _stale(c, p):  # type: ignore[no-untyped-def]
+        raise GraphSyncError("not built at its current source")
+
+    monkeypatch.setattr(probe_mod, "require_built", _stale)
+
+    rc = cli_mod.main([argv[0], str(checkout), *argv[1:]])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "not built" in captured.err
+
+
+def test_deps_prints_the_builds_reading_of_each_declaration(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    checkout = _built_checkout(tmp_path, monkeypatch, placeholder=True)
+
+    assert cli_mod.main(["deps", str(checkout)]) == 0
+    assert json.loads(capsys.readouterr().out) == [{
+        "decl": "Proj.main", "file": "Proj.lean", "kind": "theorem",
+        "has_placeholder": True, "uses": [], "proof_uses": [],
+    }]
 
 
 # ------------------------------------------------- where an argument may go

@@ -39,7 +39,9 @@ from gate.provers.select import read_prover
 from gate.state.task_record import ProjectRef, TaskRecord, TaskType
 from orchestrator import joining_prompt as _joining_prompt
 from orchestrator import poll as poll_mod
-from orchestrator.graph import GraphSyncError
+from orchestrator.graph import GraphSyncError, PlanClaimsError
+from orchestrator.graph import check_plan as _check_plan
+from orchestrator.graph import declarations as _declarations
 from orchestrator.graph import sync_graph as _graph_sync
 from orchestrator.labels import Difficulty, Priority, set_difficulty, set_priority
 from orchestrator.leases import read_lease, sync_lease_labels
@@ -182,6 +184,34 @@ def _c_sync_graph(a: argparse.Namespace) -> int:
     try:
         return _emit(_graph_sync(Path(a.checkout), check=a.check, prover=a.prover))
     except (GraphSyncError, ProverError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _c_deps(a: argparse.Namespace) -> int:
+    """What the built checkout says about the project's own declarations.
+
+    The probe half of `sync-graph` with no graph on either end, for a
+    project whose plan is not `roadmap/graph.json` and whose planner
+    wants the build's reading as data.
+    """
+    try:
+        return _emit(_declarations(Path(a.checkout), prover=a.prover))
+    except (GraphSyncError, ProverError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _c_check_plan(a: argparse.Namespace) -> int:
+    """Where a plan kept another way and the built checkout disagree.
+
+    A disagreement is the answer, so it exits 0 with `"agrees": false`
+    (module docstring). Exit 1 is for a question that could not be put:
+    claims that do not parse, or a checkout that is not built.
+    """
+    try:
+        return _emit(_check_plan(Path(a.checkout), a.plan, prover=a.prover))
+    except (PlanClaimsError, GraphSyncError, ProverError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -449,6 +479,8 @@ _NO_REPO = frozenset(
         "classify",
         "viz",
         "sync-graph",
+        "deps",
+        "check-plan",
     }
 )
 
@@ -569,6 +601,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     s.add_argument("--check", action="store_true",
                    help="report what would change and write nothing; nonempty means "
                         "a merge landed without a sync")
+
+    s = add("deps", _c_deps,
+            "the project's declarations and what each uses, read from the build")
+    s.add_argument("checkout", help="path to the local project checkout")
+
+    s = add("check-plan", _c_check_plan,
+            "where a plan kept another way disagrees with the build; writes nothing")
+    s.add_argument("checkout", help="path to the local project checkout")
+    s.add_argument("--plan", required=True, metavar="FILE",
+                   help="the plan's claims as JSON, or - to read them from stdin")
 
     s = add("poll", _c_poll,
             "block until the repo's Choir state changes, then exit")

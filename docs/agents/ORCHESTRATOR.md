@@ -81,6 +81,8 @@ covers the second step.
 | Metrics | `choir orch metrics summarize <repo>` | Per-task lifecycle data (JSON/CSV) |
 | History as a picture | `choir orch viz` | The proof tree's growth as one HTML page, from a project folder |
 | Plan upkeep | `choir orch sync-graph <checkout> [--check]` | Rewrite the roadmap's derived nodes and edges from the built source |
+| A plan kept another way | `choir orch check-plan <checkout> --plan <file \| ->` | Every place that plan's claims and the built source disagree; writes nothing (`integrations/README.md` § Holding a plan to the build) |
+| What the build says | `choir orch deps <checkout>` | Each declaration of the project, whether it holds a placeholder, and what its statement and proof use |
 | Joining prompt | `choir orch joining-prompt <repo>` | Print the hardcoded contributor prompt |
 | Staying current | `choir update` | Pull the Choir checkout, reinstall deps, refresh `choir` |
 | Overlay upgrade | `sh ~/.choir/checkout/scripts/upgrade-project.sh <checkout> --repo <owner/name>` | Refresh the project's gate overlay to this Choir (`orchestrator-setup.md` § Upgrading a mid-progress project) |
@@ -184,8 +186,9 @@ choir orch sync-graph <project-checkout> --check
 ```
 
 `sync-graph` is idempotent, so anything it reports here is a merge that
-landed without one (§ 3). A plan kept another way has its own check, named
-in its integration note. Reading a plan whose edges are stale is worse
+landed without one (§ 3). A plan kept another way is asked with
+`choir orch check-plan`, fed the claims its integration note says how to
+render. Reading a plan whose edges are stale is worse
 than reading no plan: a node with no recorded dependencies computes as
 complete, so a chapter resting on an open proof shows finished.
 
