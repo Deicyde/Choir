@@ -21,12 +21,15 @@ specifics.
 
 from orchestrator.tasks.api import (
     MaintainerError,
+    TaskBodyError,
     TaskHandle,
     TaskView,
     create_task_issue,
     get_task,
     list_choir_tasks,
     open_task_for_decl,
+    revise_task,
+    write_task,
 )
 from orchestrator.tasks.serialize import (
     body_to_task,
@@ -35,6 +38,7 @@ from orchestrator.tasks.serialize import (
 
 __all__ = [
     "MaintainerError",
+    "TaskBodyError",
     "TaskHandle",
     "TaskView",
     "body_to_task",
@@ -42,5 +46,7 @@ __all__ = [
     "get_task",
     "list_choir_tasks",
     "open_task_for_decl",
+    "revise_task",
     "task_to_body",
+    "write_task",
 ]

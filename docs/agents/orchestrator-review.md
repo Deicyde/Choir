@@ -117,8 +117,10 @@ answer from you:
 - **"This statement is wrong."** A defect in the task, not the work.
   Verify it yourself — you authored the statement and have the plan
   context the worker lacks. If they're right, fix the statement on the
-  protected branch, update the plan, and re-publish; if not, say so on
-  the issue.
+  protected branch, update the plan, and answer on the issue so the
+  reporter releases or rebases; then move the task's pin with
+  `choir orch edit-task <n> --commit <sha>`, which refuses while the task
+  is still held. If not, say so on the issue.
 - **"This proof is hard."** A progress report, not a defect. It feeds
   the struggle signal and your decomposition decision, not a change to
   the statement.

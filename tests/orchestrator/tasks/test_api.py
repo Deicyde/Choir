@@ -244,3 +244,22 @@ def test_set_task_pin_moves_the_commit_and_keeps_the_prose(monkeypatch) -> None:
     assert moved.project_ref.commit == "f" * 40
     assert kept.strip() == prose
     assert moved.target_decl == _record().target_decl
+
+
+def test_set_task_pin_writes_nothing_for_a_commit_intake_would_reject(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A body with a malformed pin fails the intake parse, and a task whose
+    body does not parse is one no worker can claim. The write has to be
+    refused before it happens; there is no check after it."""
+    view = json.dumps({"number": 7, "title": "t", "url": "u", "state": "OPEN",
+                       "labels": [], "body": task_to_body(_record(), "p")})
+    sent: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        sent.append(cmd)
+        return _FakeProc(stdout=view)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(ValueError, match="commit"):
+        set_task_pin("alice/proj", 7, "HEAD")
+
+    assert [cmd[1:3] for cmd in sent] == [["issue", "view"]]

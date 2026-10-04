@@ -6,7 +6,9 @@ The primitives:
 - :func:`list_choir_tasks`   — enumerate existing Choir issues
 - :func:`open_task_for_decl` — the open task a declaration already has
 - :func:`get_task`           — read one issue back as a TaskRecord
-- :func:`set_task_pin`       — move one issue's pinned commit
+- :func:`revise_task`        — a task with its pin, plan reference or prose changed
+- :func:`write_task`         — put a revised task back on its issue
+- :func:`set_task_pin`       — the two above, for the pinned commit alone
 
 These are intentionally low-level. Composing them (batch-creating
 issues for a benchmark, building a leaderboard, polling status) is
@@ -21,7 +23,9 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from pydantic import ValidationError
 
 from gate.state.task_record import TaskRecord, TaskType
 from orchestrator.tasks.serialize import body_to_task, task_to_body
@@ -33,6 +37,16 @@ LABEL_AVAILABLE = "choir/available"
 
 class MaintainerError(RuntimeError):
     """A `gh` / git operation failed in a maintainer-side call."""
+
+
+class TaskBodyError(MaintainerError):
+    """GitHub returned the issue, and its body is not a task record.
+
+    A `MaintainerError`, so callers that treat the two alike are unchanged.
+    Its own class because they are different answers: a failed `gh` call
+    says nothing about the issue, this says what the issue is, and a
+    command asked to act on it can report that instead of failing.
+    """
 
 
 @dataclass(frozen=True)
@@ -132,27 +146,78 @@ def create_task_issue(
     return number
 
 
-def set_task_pin(repo: str, number: int, commit: str) -> None:
-    """Rewrite one issue's `project_ref.commit`, leaving its prose intact.
+def revise_task(
+    view: TaskView,
+    *,
+    commit: str | None = None,
+    blueprint_ref: str | None = None,
+    prose: str | None = None,
+) -> TaskView:
+    """`view` with the given parts replaced; `None` leaves a part as it is.
 
-    The body is re-serialized through :func:`task_to_body`, so the result
-    round-trips through the intake parser exactly as the original did.
+    Nothing is written. Revising is separate from :func:`write_task` so a
+    caller can see what the edit would change — whether the pin moves at
+    all — and decide on that before the issue is touched.
+
+    The record is rebuilt through its validators rather than copied.
+    `model_copy(update=...)` skips them, and a malformed commit copied in
+    would be written to a body the intake parser then rejects — a task no
+    worker can claim. Raises `ValueError` naming the field instead.
+
+    The result is then read back from the body it would be written as, and
+    that reading is what is returned. Valid fields do not make a body that
+    parses: the front-matter ends at the first line that is only `---`, and
+    a multi-line plan reference can put one there. That raises `ValueError`
+    too. The parser also normalises prose (leading blank lines, line
+    endings), so the view returned holds the prose the issue will hold, and
+    an edit that normalises to what is already there shows as no change.
+    """
+    data = view.record.model_dump(by_alias=True)
+    if commit is not None:
+        data["project_ref"]["commit"] = commit
+    if blueprint_ref is not None:
+        data["blueprint_ref"] = blueprint_ref
+    try:
+        record = TaskRecord.model_validate(data)
+    except ValidationError as e:
+        raise ValueError("; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()
+        )) from e
+    try:
+        record, prose = body_to_task(
+            task_to_body(record, view.prose if prose is None else prose))
+    except ValueError as e:
+        raise ValueError(f"the revised task would not read back: {e}") from e
+    return replace(
+        view, handle=replace(view.handle, record=record), record=record, prose=prose
+    )
+
+
+def write_task(repo: str, view: TaskView) -> None:
+    """Replace an issue's body with `view`'s record and prose.
+
+    The body is re-serialized through :func:`task_to_body`. A view from
+    :func:`revise_task` has already been read back from that body through
+    the intake parser, so what is written is a task a worker can claim.
     Editing the front-matter by hand does not carry that guarantee, which
     is why this is a primitive rather than something a caller assembles.
     """
-    view = get_task(repo, number)
-    moved = view.record.model_copy(
-        update={
-            "project_ref": view.record.project_ref.model_copy(
-                update={"commit": commit}
-            )
-        }
-    )
     _gh(
-        "issue", "edit", str(number),
+        "issue", "edit", str(view.handle.number),
         "--repo", repo,
-        "--body", task_to_body(moved, view.prose),
+        "--body", task_to_body(view.record, view.prose),
     )
+
+
+def set_task_pin(repo: str, number: int, commit: str) -> None:
+    """Rewrite one issue's `project_ref.commit`, leaving its prose intact.
+
+    Asks nothing about who holds the task: the merge-time repin
+    (`orchestrator/repin.py`) calls this on what the labels show unclaimed
+    and has no thread to read. `choir orch edit-task` is where a pin move
+    is checked against the lease.
+    """
+    write_task(repo, revise_task(get_task(repo, number), commit=commit))
 
 
 def list_choir_tasks(
@@ -261,7 +326,7 @@ def open_task_for_decl(
 def get_task(repo: str, number: int) -> TaskView:
     """Read one issue and return its parsed task view.
 
-    Raises `MaintainerError` if the issue's body doesn't validate —
+    Raises `TaskBodyError` if the issue's body doesn't validate —
     callers that want to handle malformed issues should use
     :func:`list_choir_tasks` (which returns handles with
     `record=None` on failure) and inspect.
@@ -277,7 +342,7 @@ def get_task(repo: str, number: int) -> TaskView:
     try:
         record, prose = body_to_task(body)
     except ValueError as e:
-        raise MaintainerError(
+        raise TaskBodyError(
             f"issue #{number} body failed intake parse — {e}"
         ) from e
     handle = TaskHandle(

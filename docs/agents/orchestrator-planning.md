@@ -247,10 +247,10 @@ numbers and records which task this one was split out of.
   existing base declaration in a touched file; a newly added definition
   that shadows a shared one isn't caught — that's stage-two review's
   job, and the indexer's once it ships.
-- **Rewriting a shared definition is a base-SHA change.** Re-pin and
-  republish dependent unclaimed tasks; `choir orch lease <n>` says which
-  are in flight, and for those comment on the issue so the worker can
-  rebase or release. Record the rewrite
+- **Rewriting a shared definition is a base-SHA change.** Move the pin of
+  each dependent task with `choir orch edit-task <n> --commit <sha>`. It
+  refuses a task that is in flight and names the holder; for those comment
+  on the issue so the worker can rebase or release. Record the rewrite
   and why in the roadmap's log.
 - New axioms are **never yours to grant**. If a task seems to need
   one, stop and ask the overseer; once granted, the overseer updates
@@ -428,6 +428,7 @@ Compress it every loop. An entry either still guides future work or it goes:
 
 Three things are maintained, not appended: this file, `roadmap/<group>.md`, and
 the prose of every published task. Correct a published task's prose in place
+(`choir orch edit-task <n> --prose …`, which replaces the whole prose)
 when a fact in it stops being true — a lemma renamed, a library gap closed, a
 route retracted. A correction on the PR does not reach the next claimant; they
 read the issue. The overseer

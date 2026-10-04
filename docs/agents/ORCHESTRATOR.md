@@ -69,7 +69,7 @@ covers the second step.
 | Tool | Invocation | Purpose |
 |---|---|---|
 | Loop clock | `choir orch poll [--once]` | Block until something changes on GitHub, then exit with a JSON diff |
-| Tasks | `choir orch tasks \| task \| create-task` | List, read, and publish Choir task issues |
+| Tasks | `choir orch tasks \| task \| create-task \| edit-task` | List, read, and publish Choir task issues; change an open one's pin, plan reference or prose in place |
 | PRs | `choir orch prs \| pr \| pr-diff \| pr-comments` | Open PRs with their check verdicts, diffs, comments |
 | Acting on a PR | `choir orch merge \| close` | Merge (refuses unless green), close |
 | Answering | `choir orch comment <n> --body ...` | Leave a comment on a task issue or a PR — one number, either kind |
@@ -487,11 +487,12 @@ names the plan node this task fills.
 creates nothing and answers `{"created": false, "number": …, "refused": …}`
 with the existing issue's number, so re-running a publish step is safe. The
 match is on `--target-file` and `--target-decl` together, not on
-`--blueprint-ref`, so a node renamed in the plan is still caught and a
-declaration moved to another file is not. Once the project has 1000 open
-tasks, the most one listing returns, a search that finds no match among
-them refuses with no number, because a duplicate past the listing's end
-would go unseen. `--allow-duplicate` publishes regardless.
+`--blueprint-ref`, so a node renamed in the plan is still caught; point the
+existing task at the new id with `edit-task <n> --blueprint-ref <id>`. A
+declaration moved to another file is not caught. Once the project has 1000
+open tasks, the most one listing returns, a search that finds no match
+among them refuses with no number, because a duplicate past the listing's
+end would go unseen. `--allow-duplicate` publishes regardless.
 
 **Publish only tasks that are ready to work on.** An available issue must
 be genuinely available, so a blocked node stays in the plan and never

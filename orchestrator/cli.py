@@ -62,11 +62,16 @@ from orchestrator.runs import approve_runs_for_sha, pending_approvals
 from orchestrator.salvage import classify_failure, create_salvage_task
 from orchestrator.tasks import (
     MaintainerError,
+    TaskBodyError,
+    TaskView,
     create_task_issue,
     get_task,
     list_choir_tasks,
     open_task_for_decl,
+    revise_task,
+    write_task,
 )
+from orchestrator.tasks.api import LABEL_TASK
 from viz.report import DEFAULT_NAME as _VIZ_NAME
 from viz.report import ReportError
 from viz.report import report as _viz_report
@@ -215,6 +220,70 @@ def _c_create_task(a: argparse.Namespace) -> int:
         extra_labels=tuple(a.label),
     )
     return _emit({"created": True, "number": number, "title": a.title})
+
+
+def _task_changes(before: TaskView, after: TaskView) -> dict[str, dict[str, str | None]]:
+    """The parts of a task an edit moved, each as its old and new value."""
+    parts = {
+        "commit": (before.record.project_ref.commit, after.record.project_ref.commit),
+        "blueprint_ref": (before.record.blueprint_ref, after.record.blueprint_ref),
+        "prose": (before.prose, after.prose),
+    }
+    return {k: {"from": old, "to": new} for k, (old, new) in parts.items() if old != new}
+
+
+def _c_edit_task(a: argparse.Namespace) -> int:
+    """Change a published task's pin, plan reference or prose in place.
+
+    Closing a task and publishing another loses its thread and its number,
+    and nothing else moves a pin for a commit the orchestrator pushed
+    itself: the repin runs on a merged PR (`orchestrator/repin.py`).
+
+    A task somebody holds keeps its pin. The commit on the issue is the
+    tree its worker cloned, and moving it leaves the issue naming a tree
+    the holder never built on. The plan reference and the prose are not
+    part of what was claimed, so those stay editable; the next reader of
+    the issue should see them right. The lease is read from the thread
+    here, not from the label, which can lag a claim.
+
+    An edit is whole or not at all: a refused pin move writes none of the
+    other parts either, so the answer never has to describe half an edit.
+    """
+    if a.commit is None and a.blueprint_ref is None and a.prose is None:
+        print("error: give at least one of --commit, --blueprint-ref, --prose",
+              file=sys.stderr)
+        return 1
+
+    def refuse(why: str) -> int:
+        return _emit({"edited": False, "number": a.number, "refused": why})
+
+    try:
+        view = get_task(a.repo, a.number)
+    except TaskBodyError as e:
+        return refuse(str(e))
+    if LABEL_TASK not in view.handle.labels:
+        return refuse(f"#{a.number} does not carry the {LABEL_TASK} label, "
+                      "so it is not a Choir task.")
+    if view.handle.state != "open":
+        return refuse(f"task #{a.number} is {view.handle.state}; only an open task is edited.")
+    try:
+        revised = revise_task(
+            view, commit=a.commit, blueprint_ref=a.blueprint_ref, prose=a.prose)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    changed = _task_changes(view, revised)
+    if "commit" in changed:
+        lease = read_lease(a.repo, a.number)
+        if lease.holder is not None:
+            return refuse(
+                f"#{a.number} is held by @{lease.holder}, and a claimed task keeps "
+                "the commit its worker claimed; comment on the issue so they can "
+                "rebase or release.")
+    if changed:
+        write_task(a.repo, revised)
+    return _emit({"edited": bool(changed), "number": a.number, "changed": changed})
 
 
 # ------------------------------------------------------------- mutations
@@ -579,6 +648,15 @@ def _add_task_commands(add) -> None:  # type: ignore[no-untyped-def]
     s.add_argument("--label", action="append", default=[], help="extra label (repeatable)")
     s.add_argument("--allow-duplicate", action="store_true",
                    help="publish even if the declaration already has an open task")
+
+    s = add("edit-task", _c_edit_task,
+            "change an open task's pin, plan reference or prose in place")
+    _add_number(s, "--issue")
+    s.add_argument("--commit", default=None,
+                   help="project_ref commit to pin; refused while the task is held")
+    s.add_argument("--blueprint-ref", default=None, help="the plan node this fills")
+    s.add_argument("--prose", default=None,
+                   help="replaces the whole prose: statement context, hints, references")
 
 
 def main(argv: list[str] | None = None) -> int:

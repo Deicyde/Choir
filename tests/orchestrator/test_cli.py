@@ -17,11 +17,15 @@ non-zero is reserved for producing no answer at all.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from gate.state.intake import ParseSuccess, parse_issue_body
+from gate.state.lease_comment import ACTION_CLAIM, LeaseClaim, render_lease_comment
 from gate.state.task_record import ProjectRef, TaskRecord, TaskType
 from orchestrator import cli as cli_mod
+from orchestrator import leases as leases_mod
 from orchestrator.prs import PRError
 from orchestrator.tasks import api as tasks_api
 from orchestrator.tasks.serialize import task_to_body
@@ -212,15 +216,26 @@ def _task_body(decl: str = "Sample.foo", *, file: str = "Sample/Foo.lean",
 
 
 class _Board:
-    """A repo's issues, answering the `gh` calls the task commands make."""
+    """A repo's issues, answering the `gh` calls the task commands make.
 
-    def __init__(self, *issues: dict[str, object]) -> None:
+    `comments` is the thread of every issue, as the lease reader's `--jq`
+    projection returns it. An edit lands in `issues`, so a test reads the
+    body back the way the next worker would.
+    """
+
+    def __init__(self, *issues: dict[str, object],
+                 comments: list[dict[str, object]] | None = None) -> None:
         self.issues = [
             {"title": "t", "url": "u", "state": "OPEN",
              "labels": [{"name": "choir/task"}], **issue}
             for issue in issues
         ]
+        self.comments = comments or []
         self.created: list[str] = []
+        self.edited: list[int] = []
+
+    def issue(self, number: int) -> dict[str, object]:
+        return next(i for i in self.issues if i["number"] == number)
 
     def __call__(self, *args: str) -> str:
         def opt(flag: str) -> str:
@@ -234,6 +249,14 @@ class _Board:
         if args[:2] == ("issue", "create"):
             self.created.append(opt("--body"))
             return "https://github.com/o/r/issues/99\n"
+        if args[:2] == ("issue", "view"):
+            return json.dumps(self.issue(int(args[2])))
+        if args[:2] == ("issue", "edit"):
+            self.issue(int(args[2]))["body"] = opt("--body")
+            self.edited.append(int(args[2]))
+            return ""
+        if args[0] == "api" and args[2].endswith("/comments"):
+            return json.dumps(self.comments)
         raise AssertionError(f"unexpected gh call: {args}")
 
 
@@ -301,3 +324,170 @@ def test_create_task_refuses_when_the_open_tasks_could_not_all_be_read(monkeypat
     assert payload["created"] is False
     assert "number" not in payload
     assert board.created == []
+
+
+# ------------------------------------------------- editing a published task
+#
+# The body `edit-task` writes is the one the next worker's client parses, so
+# each edit is read back through the gate's intake parser, not through the
+# orchestrator's own reader.
+
+OLD_PROSE = "Induct on `n`.\n\n---\n\nSee `Sample.bar` for the shape."
+
+
+def _board_with_task(monkeypatch, *comments: dict[str, object], **issue: object) -> _Board:  # type: ignore[no-untyped-def]
+    board = _Board(
+        {"number": 7, "body": _task_body(blueprint_ref="old-node", prose=OLD_PROSE), **issue},
+        comments=list(comments),
+    )
+    monkeypatch.setattr(tasks_api, "_gh", board)
+    monkeypatch.setattr(leases_mod, "_gh", board)
+    return board
+
+
+def _claim(login: str, *, hours_ago: float) -> dict[str, object]:
+    seen = datetime.now(UTC) - timedelta(hours=hours_ago)
+    return {
+        "id": 1, "login": login, "updated_at": seen.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "body": render_lease_comment(LeaseClaim(login=login, action=ACTION_CLAIM, protocol=1)),
+    }
+
+
+def _parsed(body: object) -> tuple[dict[str, object], str]:
+    result = parse_issue_body(str(body), expected_repo="o/r")
+    assert isinstance(result, ParseSuccess), result
+    return result.record.model_dump(), result.body_prose
+
+
+@pytest.mark.parametrize(("flag", "value"), [
+    ("--commit", "b" * 40),
+    ("--blueprint-ref", "new-node"),
+    ("--prose", "Induct on `n`; `Sample.bar` was renamed `Sample.baz`."),
+])
+def test_edit_task_changes_one_part_and_keeps_the_rest(flag, value, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    board = _board_with_task(monkeypatch)
+    record, prose = _parsed(board.issue(7)["body"])
+    old = {"--commit": "a" * 40, "--blueprint-ref": "old-node", "--prose": OLD_PROSE}[flag]
+
+    assert cli_mod.main(["--repo", "o/r", "edit-task", "7", flag, value]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "edited": True, "number": 7,
+        "changed": {flag[2:].replace("-", "_"): {"from": old, "to": value}},
+    }
+    if flag == "--commit":
+        record["project_ref"]["commit"] = value  # type: ignore[index]
+    elif flag == "--blueprint-ref":
+        record["blueprint_ref"] = value
+    else:
+        prose = value
+    assert _parsed(board.issue(7)["body"]) == (record, prose)
+
+
+def test_edit_task_will_not_move_the_pin_of_a_held_task(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The holder cloned the pinned commit. The prose asked for in the same
+    call is not written either: an edit is whole or not at all."""
+    board = _board_with_task(monkeypatch, _claim("alice", hours_ago=1))
+
+    rc = cli_mod.main(["--repo", "o/r", "edit-task", "7",
+                       "--commit", "b" * 40, "--prose", "new"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["edited"] is False
+    assert "alice" in payload["refused"]
+    assert board.edited == []
+
+
+def test_edit_task_corrects_the_plan_ref_and_prose_of_a_held_task(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Neither is part of what the holder claimed, and the pin they did
+    claim is the one thing that must come through untouched."""
+    board = _board_with_task(monkeypatch, _claim("alice", hours_ago=1))
+
+    assert cli_mod.main(["--repo", "o/r", "edit-task", "7",
+                         "--blueprint-ref", "new-node", "--prose", "new"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["edited"] is True
+    record, prose = _parsed(board.issue(7)["body"])
+    assert (record["blueprint_ref"], prose) == ("new-node", "new")
+    assert record["project_ref"]["commit"] == "a" * 40  # type: ignore[index]
+
+
+def test_naming_the_pin_a_held_task_already_has_is_not_a_refusal(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """What is refused is moving the pin. A script that sets every open task
+    to one commit should not be told no by the tasks already on it."""
+    board = _board_with_task(monkeypatch, _claim("alice", hours_ago=1))
+
+    assert cli_mod.main(["--repo", "o/r", "edit-task", "7", "--commit", "a" * 40]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"edited": False, "number": 7, "changed": {}}
+    assert board.edited == []
+
+
+@pytest.mark.parametrize("thread", [
+    [],
+    [_claim("alice", hours_ago=72)],
+])
+def test_edit_task_moves_the_pin_when_nobody_holds_the_task(thread, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """No claim, or a claimant quiet past the staleness window: the arbiter
+    a claiming worker runs gives the same answer, so there is no holder
+    whose clone the move could contradict."""
+    board = _board_with_task(monkeypatch, *thread)
+
+    assert cli_mod.main(["--repo", "o/r", "edit-task", "7", "--commit", "b" * 40]) == 0
+
+    assert json.loads(capsys.readouterr().out)["edited"] is True
+    assert _parsed(board.issue(7)["body"])[0]["project_ref"]["commit"] == "b" * 40  # type: ignore[index]
+
+
+@pytest.mark.parametrize("issue", [
+    {"labels": []},
+    {"state": "CLOSED"},
+    {"body": "Something is broken in the build, not a task."},
+])
+def test_edit_task_refuses_what_is_not_an_open_task(issue, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """An issue that reads, and is not an open Choir task, is an answer:
+    exit 0, said in the payload, and the issue left as it was."""
+    board = _board_with_task(monkeypatch, **issue)
+    before = board.issue(7)["body"]
+
+    rc = cli_mod.main(["--repo", "o/r", "edit-task", "7", "--prose", "new"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["edited"] is False
+    assert payload["refused"]
+    assert board.issue(7)["body"] == before
+
+
+def test_edit_task_reports_the_prose_the_issue_will_hold(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The intake parser drops leading blank lines, so what was typed is not
+    what the next reader gets. The answer names the latter, and asking for
+    the same thing again finds nothing left to change."""
+    board = _board_with_task(monkeypatch)
+    argv = ["--repo", "o/r", "edit-task", "7", "--prose", "\n\nSee `Sample.baz`.\r\nInduct."]
+    held = "See `Sample.baz`.\nInduct."
+
+    assert cli_mod.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)["changed"]["prose"]["to"] == held
+    assert _parsed(board.issue(7)["body"])[1] == held
+
+    assert cli_mod.main(argv) == 0
+    assert json.loads(capsys.readouterr().out) == {"edited": False, "number": 7, "changed": {}}
+    assert board.edited == [7]
+
+
+@pytest.mark.parametrize("flags", [
+    [], ["--commit", "HEAD"], ["--blueprint-ref", "old\n---\nnode"],
+])
+def test_edit_task_with_nothing_valid_to_write_is_a_usage_error(flags, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """No part named, a commit the intake parser would reject once it was in
+    the body, or a plan reference whose own `---` line would end the
+    front-matter early: none produced an answer about the task, and a body
+    written from the last two is a task nothing can read or repair."""
+    board = _board_with_task(monkeypatch)
+
+    assert cli_mod.main(["--repo", "o/r", "edit-task", "7", *flags]) == 1
+
+    assert capsys.readouterr().out == ""
+    assert board.edited == []
