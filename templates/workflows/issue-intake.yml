@@ -12,10 +12,6 @@ permissions:
   issues: write
   contents: read
 
-concurrency:
-  group: choir-intake-${{ github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   intake:
     # Only react to issues that are either (a) being onboarded as Choir tasks
@@ -37,6 +33,15 @@ jobs:
        github.event.label.name == 'choir/invalid') &&
       (contains(github.event.issue.labels.*.name, 'choir/available') ||
        contains(github.event.issue.labels.*.name, 'choir/invalid'))
+    # On the job, not the workflow. A workflow-level group is joined by
+    # every run, including the ones this `if` then skips, so a later
+    # `choir/task` or `choir/difficulty:*` label cancelled the run that was
+    # validating the issue and did nothing itself: the task got no
+    # acknowledgement and no type label. A skipped job never joins the
+    # group, so only a run that will validate can cancel another.
+    concurrency:
+      group: choir-intake-${{ github.event.issue.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
