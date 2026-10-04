@@ -21,12 +21,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from gate.checks import REQUIRED_PRESENT
 from gate.state.intake import ParseSuccess, parse_issue_body
 from gate.state.lease_comment import ACTION_CLAIM, LeaseClaim, render_lease_comment
 from gate.state.task_record import ProjectRef, TaskRecord, TaskType
 from orchestrator import cli as cli_mod
 from orchestrator import leases as leases_mod
-from orchestrator.prs import PRError
+from orchestrator import prs as prs_mod
+from orchestrator.prs import CheckResult, PRError, PRView
 from orchestrator.tasks import api as tasks_api
 from orchestrator.tasks.serialize import task_to_body
 
@@ -98,6 +100,81 @@ def test_unreadable_pr_is_infrastructure_failure_not_a_refusal(monkeypatch, caps
 
     assert rc == 2
     assert capsys.readouterr().out == ""
+
+
+def _green_pr(number: int, files: tuple[str, ...], *, files_truncated: bool = False) -> PRView:
+    return PRView(
+        number=number, title="t", url="u", author="alice", state="open", body="",
+        base_sha="a" * 40, head_sha="b" * 40, labels=(), files=files,
+        checks=tuple(
+            CheckResult(name=name, status="COMPLETED", conclusion="SUCCESS")
+            for name in REQUIRED_PRESENT
+        ),
+        linked_issues=(), mergeable="MERGEABLE", files_truncated=files_truncated,
+    )
+
+
+def _no_project_policy(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """GitHub's answer for a base commit with no `.choir/verify.toml`."""
+    answer = {"data": {"repository": {"commit": {"oid": "a" * 40}, "file": None}}}
+    monkeypatch.setattr(prs_mod, "_gh", lambda *args: json.dumps(answer))
+
+
+def test_pr_reports_protected_paths_and_is_not_mergeable_now(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Triage and merge have to agree: every check here is green, and
+    `merge` would still refuse."""
+    _no_project_policy(monkeypatch)
+    pr = _green_pr(7, ("Sample/Foo.lean", ".github/workflows/x.yml"))
+    monkeypatch.setattr(cli_mod, "get_pr", lambda repo, number: pr)
+
+    assert cli_mod.main(["--repo", "o/r", "pr", "7"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["protected_paths"] == [".github/workflows/x.yml"]
+    assert payload["protected_paths_incomplete"] is None
+    assert payload["blocking_failures"] == []
+    assert payload["mergeable_now"] is False
+
+
+def test_prs_says_when_a_truncated_file_list_leaves_the_answer_open(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """`prs` sees a PR's first hundred files. A PR padded past that must
+    not come back with a clean list and `mergeable_now` true."""
+    _no_project_policy(monkeypatch)
+    padded = tuple(f"Sample/Pad{i}.lean" for i in range(100))
+    monkeypatch.setattr(
+        cli_mod, "list_open_prs",
+        lambda repo, limit: [
+            _green_pr(7, ("Sample/Foo.lean",)),
+            _green_pr(8, padded, files_truncated=True),
+        ],
+    )
+
+    assert cli_mod.main(["--repo", "o/r", "prs"]) == 0
+
+    whole, truncated = json.loads(capsys.readouterr().out)
+    assert whole["protected_paths"] == []
+    assert whole["protected_paths_incomplete"] is None
+    assert whole["mergeable_now"] is True
+    assert truncated["protected_paths"] == []
+    assert "100" in truncated["protected_paths_incomplete"]
+    assert truncated["mergeable_now"] is False
+
+
+def test_pr_says_when_the_projects_policy_could_not_be_read(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """`merge` would refuse this PR, so triage must not call it ready —
+    and it is still an answer, not a crash."""
+    def _fail(*args):  # type: ignore[no-untyped-def]
+        raise PRError("gh api graphql failed — HTTP 502")
+
+    monkeypatch.setattr(prs_mod, "_gh", _fail)
+    monkeypatch.setattr(cli_mod, "get_pr", lambda repo, number: _green_pr(7, ("Sample/Foo.lean",)))
+
+    assert cli_mod.main(["--repo", "o/r", "pr", "7"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["protected_paths"] == []
+    assert "HTTP 502" in payload["protected_paths_incomplete"]
+    assert payload["mergeable_now"] is False
 
 
 def test_viz_needs_no_repo_and_no_arguments(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]

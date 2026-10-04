@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import pytest
 
 from gate.checks import REQUIRED_PRESENT
+from orchestrator import prs as prs_mod
 from orchestrator.prs import (
     PRError,
     get_pr,
@@ -16,12 +17,103 @@ from orchestrator.prs import (
     merge_pr,
 )
 
+# The unpatched `_gh`, for the one test that needs a `gh` failure to arrive
+# the way it really does rather than through the fixtures below.
+_REAL_GH = prs_mod._gh
+
 
 @dataclass
 class _FakeProc:
     stdout: str
     stderr: str = ""
     returncode: int = 0
+
+
+class _BasePolicy:
+    """What GitHub serves for `.choir/verify.toml` at the PR's base commit.
+
+    `text=None` is a project with no such file, which is the default so the
+    tests about checks need not mention it. `gh_fails` makes the read itself
+    fail; `commit_resolves=False` answers as GitHub does for a commit it
+    cannot find, where the file field is null for a different reason than
+    absence. `file` replaces the file object outright, for the answers that
+    are a file but not one whose text can be read.
+    """
+
+    def __init__(self) -> None:
+        self.text: str | None = None
+        self.file: dict | None = None
+        self.gh_fails = False
+        self.commit_resolves = True
+        self.asked: list[tuple[str, ...]] = []
+
+    def answer(self, args: tuple[str, ...]) -> str:
+        self.asked.append(args)
+        if self.gh_fails:
+            raise PRError("gh api graphql failed — HTTP 502")
+        file = self.file
+        if file is None and self.text is not None:
+            file = {"text": self.text, "isTruncated": False}
+        commit = {"oid": "a" * 40} if self.commit_resolves else None
+        return json.dumps({"data": {"repository": {"commit": commit, "file": file}}})
+
+
+@pytest.fixture(autouse=True)
+def base_policy(monkeypatch) -> _BasePolicy:  # type: ignore[no-untyped-def]
+    """Answer the preflight's policy read; every other `gh` call falls
+    through to whatever `subprocess.run` the test installed."""
+    policy = _BasePolicy()
+    real_gh = prs_mod._gh
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("api", "graphql"):
+            return policy.answer(args)
+        return real_gh(*args)
+
+    monkeypatch.setattr(prs_mod, "_gh", fake_gh)
+    return policy
+
+
+@pytest.fixture(autouse=True)
+def rest_listing(monkeypatch) -> list[str]:  # type: ignore[no-untyped-def]
+    """Answer `get_pr`'s REST file listing: the lines `gh --jq` prints.
+
+    Left empty, it names the paths the test's `gh pr view` payload carried,
+    so a test states a PR's files once. A test fills it to serve what
+    `gh pr view` cannot show: files past the hundredth, or the old path of
+    a rename.
+    """
+    listing: list[str] = []
+    viewed: list[str] = []
+    inner_gh = prs_mod._gh
+
+    def fake_gh(*args: str) -> str:
+        if "--paginate" in args:
+            lines = listing or [f["path"] for f in json.loads(viewed[-1])["files"]]
+            return "".join(f"{line}\n" for line in lines)
+        out = inner_gh(*args)
+        if args[:2] == ("pr", "view"):
+            viewed.append(out)
+        return out
+
+    monkeypatch.setattr(prs_mod, "_gh", fake_gh)
+    return listing
+
+
+def _run_gh(monkeypatch, payload: dict) -> list[list[str]]:  # type: ignore[no-untyped-def]
+    """Serve `payload` as the PR and record every `gh` call made."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(cmd)
+        return _FakeProc(stdout=json.dumps(payload))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def _merges(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if "merge" in c]
 
 
 def _pr_payload(**overrides) -> dict:  # type: ignore[no-untyped-def]
@@ -397,7 +489,7 @@ def test_merge_pr_force_names_prover_and_non_blocking_red(monkeypatch) -> None: 
     )
 
 
-def test_get_pr_paginates_past_the_hundred_file_cap(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_get_pr_paginates_past_the_hundred_file_cap(monkeypatch, rest_listing) -> None:  # type: ignore[no-untyped-def]
     """`gh pr view --json files` truncates at 100 with no error and no
     marker. `docs/agents/ORCHESTRATOR.md` § Boundaries has the orchestrator refuse
     any PR touching `.github/`, and that rule reads `pr.files` — so a PR
@@ -407,16 +499,13 @@ def test_get_pr_paginates_past_the_hundred_file_cap(monkeypatch) -> None:  # typ
     """
     padded = [{"path": f"Sample/Pad{i}.lean"} for i in range(100)]
     payload = _pr_payload(files=padded, statusCheckRollup=_green_rollup())
-    full = [f"Sample/Pad{i}.lean" for i in range(100)] + [
-        ".github/workflows/verify-axiom-honesty.yml"
-    ]
-
-    def fake_run(cmd, **k):  # type: ignore[no-untyped-def]
-        if "--paginate" in cmd:
-            return _FakeProc(stdout="\n".join(full) + "\n")
-        return _FakeProc(stdout=json.dumps(payload))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    rest_listing.extend(
+        [f"Sample/Pad{i}.lean" for i in range(100)]
+        + [".github/workflows/verify-axiom-honesty.yml"]
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **k: _FakeProc(stdout=json.dumps(payload))
+    )
     pr = get_pr("alice/proj", 5)
     assert ".github/workflows/verify-axiom-honesty.yml" in pr.files
     assert len(pr.files) == 101
@@ -434,3 +523,208 @@ def test_list_open_prs_flags_a_truncated_file_list_rather_than_hiding_it(monkeyp
     )
     (pr,) = list_open_prs("alice/proj")
     assert pr.files_truncated is True
+
+
+# --- protected paths -------------------------------------------------------
+#
+# Every PR below carries a fully green gate, so a refusal can only be the
+# path: a PR that rewrote a workflow or a gate module is exactly the PR whose
+# checks say nothing.
+
+
+@pytest.mark.parametrize("path", [
+    ".github/workflows/x.yml",
+    "gate/checks.py",
+    "lean-toolchain",
+    # No prover is passed, so the other provers' manifests are covered too.
+    "Session/ROOT",
+    "proj.opam",
+    # Another spelling of the same file on a case-insensitive checkout.
+    ".GitHub/workflows/x.yml",
+    "Lakefile.toml",
+])
+def test_merge_pr_refuses_a_pr_that_changes_a_protected_path(monkeypatch, path) -> None:  # type: ignore[no-untyped-def]
+    payload = _pr_payload(
+        files=[{"path": "Sample/Foo.lean"}, {"path": path}],
+        statusCheckRollup=_green_rollup(),
+    )
+    calls = _run_gh(monkeypatch, payload)
+    with pytest.raises(PRError, match="protected paths") as exc_info:
+        merge_pr("o/r", 7)
+    assert path in str(exc_info.value)
+    assert "Sample/Foo.lean" not in str(exc_info.value)
+    assert _merges(calls) == [], "must not call gh pr merge"
+
+
+def test_merge_pr_names_the_protected_path_before_any_check(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A red check on a PR that edited the gate is the gate's edited copy
+    talking. The refusal has to be about the path, or the feedback sends the
+    contributor to fix a check on a PR that is refused whatever it says."""
+    payload = _pr_payload(
+        files=[{"path": "gate/checks.py"}],
+        statusCheckRollup=_green_rollup(except_for="rebuild"),
+    )
+    _run_gh(monkeypatch, payload)
+    with pytest.raises(PRError) as exc_info:
+        merge_pr("o/r", 7)
+    assert "gate/checks.py" in str(exc_info.value)
+    assert "rebuild" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(("entry", "path", "refused"), [
+    ("blueprint/", "blueprint/roadmap/a.md", True),
+    ("blueprint/", "blueprints/x", False),
+    ("blueprint/", "docs/blueprint/y", False),
+    # A directory written without its slash is still the directory.
+    ("blueprint", "blueprint/roadmap/a.md", True),
+    ("blueprint", "blueprints/x", False),
+    ("blueprint", "docs/blueprint/y", False),
+    ("docs/plan.md", "docs/plan.md", True),
+    ("docs/plan.md", "docs/plan.md.bak", False),
+    ("docs/plan.md", "other/docs/plan.md", False),
+    ("blueprint/", "Blueprint/roadmap/a.md", True),
+])
+def test_merge_pr_holds_a_pr_to_the_projects_own_protected_paths(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy, entry, path, refused
+) -> None:
+    """An entry is the path it names and what is under it, anchored at the
+    repo root."""
+    base_policy.text = f'[protected]\npaths = ["{entry}"]\n'
+    payload = _pr_payload(files=[{"path": path}], statusCheckRollup=_green_rollup())
+    calls = _run_gh(monkeypatch, payload)
+    if refused:
+        with pytest.raises(PRError, match="protected paths") as exc_info:
+            merge_pr("o/r", 7)
+        assert path in str(exc_info.value)
+        assert _merges(calls) == []
+    else:
+        merge_pr("o/r", 7)
+        assert len(_merges(calls)) == 1
+
+
+def test_merge_pr_reads_the_projects_protected_paths_at_the_base_commit(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy
+) -> None:
+    """The head is the contributor's: a PR could take its own files off the
+    list in the same diff."""
+    payload = _pr_payload(statusCheckRollup=_green_rollup())
+    _run_gh(monkeypatch, payload)
+    merge_pr("o/r", 7)
+    (asked,) = base_policy.asked
+    assert f"expr={payload['baseRefOid']}:.choir/verify.toml" in asked
+    assert not any(payload["headRefOid"] in arg for arg in asked)
+
+
+def test_merge_pr_refuses_a_pr_that_renames_a_file_out_of_a_protected_path(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy, rest_listing
+) -> None:
+    """`gh pr view` names a renamed file by where it went. Judged on that, a
+    PR could move a plan file (or `.choir/verify.toml` itself) out of its
+    protected directory and show nothing under it."""
+    base_policy.text = '[protected]\npaths = ["blueprint/"]\n'
+    payload = _pr_payload(
+        files=[{"path": "attic/a.md"}], statusCheckRollup=_green_rollup()
+    )
+    rest_listing.extend(["attic/a.md", "blueprint/roadmap/a.md"])
+    calls = _run_gh(monkeypatch, payload)
+    with pytest.raises(PRError, match="protected paths") as exc_info:
+        merge_pr("o/r", 7)
+    assert "blueprint/roadmap/a.md" in str(exc_info.value)
+    assert _merges(calls) == []
+
+
+@pytest.mark.parametrize("break_policy", [
+    lambda policy, payload: setattr(policy, "gh_fails", True),
+    lambda policy, payload: setattr(policy, "text", '[protected]\npaths = "blueprint/"\n'),
+    # A null file under a commit GitHub could not find is not an absent file.
+    lambda policy, payload: setattr(policy, "commit_resolves", False),
+    # Nor is a file with no text (a tree or a binary at that path), or one
+    # GitHub cut short before `[protected]`: what arrived parses, and is not
+    # the policy.
+    lambda policy, payload: setattr(policy, "file", {}),
+    lambda policy, payload: setattr(
+        policy, "file", {"text": '[audits.sorry_delta]\npolicy = "report"\n', "isTruncated": True}
+    ),
+    lambda policy, payload: payload.update(baseRefOid=""),
+], ids=[
+    "gh-fails", "malformed", "base-commit-unresolved", "not-text", "truncated",
+    "no-base-commit",
+])
+def test_merge_pr_refuses_when_the_base_policy_cannot_be_read(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy, break_policy
+) -> None:
+    """Fail closed: the PR is clean as far as anyone can tell, but nobody
+    can tell what the project protects."""
+    payload = _pr_payload(statusCheckRollup=_green_rollup())
+    break_policy(base_policy, payload)
+    calls = _run_gh(monkeypatch, payload)
+    with pytest.raises(PRError, match="could not be read"):
+        merge_pr("o/r", 7)
+    assert _merges(calls) == []
+
+
+def test_a_failed_policy_read_reports_what_gh_said_not_the_query_it_sent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The reason is quoted into the refusal and, on an override, into a PR
+    comment that stays. `_gh` leads its own message with the command line,
+    which for this read is the whole query."""
+    payload = _pr_payload(statusCheckRollup=_green_rollup())
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        if "graphql" in cmd:
+            raise subprocess.CalledProcessError(1, cmd, stderr="gh: HTTP 502\n")
+        if "--paginate" in cmd:
+            return _FakeProc(stdout="Sample/Foo.lean\n")
+        return _FakeProc(stdout=json.dumps(payload))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(prs_mod, "_gh", _REAL_GH)
+    with pytest.raises(PRError, match="could not be read") as exc_info:
+        merge_pr("o/r", 7)
+    assert "gh: HTTP 502" in str(exc_info.value)
+    assert "repository(" not in str(exc_info.value)
+
+
+def test_merge_pr_force_merges_past_protected_paths_and_names_them(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy
+) -> None:
+    """A change to the gate's own files is the overseer's to make, and the
+    override is how they make it through a PR — on the record."""
+    base_policy.text = '[protected]\npaths = ["blueprint/"]\n'
+    payload = _pr_payload(
+        files=[
+            {"path": "blueprint/roadmap/a.md"},
+            {"path": "lean-toolchain"},
+            {"path": "Sample/Foo.lean"},
+        ],
+        statusCheckRollup=_green_rollup(),
+    )
+    calls = _run_gh(monkeypatch, payload)
+    merge_pr("o/r", 7, force="toolchain bump; verified locally")
+
+    (commented,) = [c for c in calls if any("/comments" in part for part in c)]
+    body = "\n".join(commented)
+    assert "blueprint/roadmap/a.md" in body
+    assert "lean-toolchain" in body
+    assert "Sample/Foo.lean" not in body
+    assert "green" in body, "the checks' own state must still be on the trail"
+    assert len(_merges(calls)) == 1
+
+
+def test_merge_pr_force_records_a_policy_it_could_not_read(  # type: ignore[no-untyped-def]
+    monkeypatch, base_policy
+) -> None:
+    """The override must still work here — a malformed `.choir/verify.toml`
+    on the base branch is repaired by a PR that only an override can merge —
+    but the trail must not read as though the paths were checked."""
+    base_policy.text = "[protected]\npaths = [3]\n"
+    payload = _pr_payload(
+        files=[{"path": ".choir/verify.toml"}], statusCheckRollup=_green_rollup()
+    )
+    calls = _run_gh(monkeypatch, payload)
+    merge_pr("o/r", 7, force="repair the policy file")
+
+    (commented,) = [c for c in calls if any("/comments" in part for part in c)]
+    body = "\n".join(commented)
+    assert ".choir/verify.toml" in body
+    assert "not fully checked" in body
+    assert len(_merges(calls)) == 1

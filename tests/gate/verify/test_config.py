@@ -85,3 +85,37 @@ def test_unknown_fields_ignored_forward_compat() -> None:
         'enabled = true\n'
     )
     assert cfg.axiom_honesty.policy is AxiomPolicy.NET_ZERO
+
+
+# --- protected paths -------------------------------------------------------
+
+
+def test_protected_paths_parsed() -> None:
+    cfg = parse_verify_config('[protected]\npaths = ["blueprint/", "docs/plan.md"]\n')
+    assert cfg.protected.paths == ("blueprint/", "docs/plan.md")
+
+
+@pytest.mark.parametrize("text", [
+    'protected = "blueprint/"\n',
+    '[protected]\npaths = "blueprint/"\n',
+    '[protected]\npaths = ["blueprint/", 3]\n',
+])
+def test_malformed_protected_section_raises(text: str) -> None:
+    with pytest.raises(VerifyConfigError, match="protected"):
+        parse_verify_config(text)
+
+
+@pytest.mark.parametrize("entry", [
+    "",
+    "/",
+    "/blueprint/",
+    "./blueprint/",
+    "blueprint/../.github/",
+    "blueprint//roadmap/",
+    "blueprint/*.md",
+])
+def test_protected_entry_that_could_never_match_raises(entry: str) -> None:
+    """Changed paths are compared as text, repo-relative. An entry in any
+    other spelling would parse, protect nothing, and look like protection."""
+    with pytest.raises(VerifyConfigError, match=r"protected\.paths entry"):
+        parse_verify_config(f"[protected]\npaths = [{entry!r}]\n")

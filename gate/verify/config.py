@@ -14,9 +14,21 @@ Format::
     [audits.sorry_delta]
     policy = "block"  # or "report"
 
+    [protected]
+    paths = ["blueprint/"]
+
 If the file is absent, all audits use their built-in defaults
 (net-zero comparison against base; sorry policy `block`). Missing
 sections mean the default for that section.
+
+`[protected]` is not an audit and no workflow acts on it: the orchestrator's
+merge preflight (`orchestrator/prs.py`) reads it and refuses a PR that
+changes a listed path. The workflows do parse the whole file, so a malformed
+`[protected]` puts every audit on its defaults like any other malformed
+section. It lives in this file because it is the same
+kind of statement — policy the overseer sets on the protected branch — and
+must be read the same way, from the base commit: a PR that could edit the
+list in its own diff could take its own files off it.
 """
 
 from __future__ import annotations
@@ -85,16 +97,60 @@ class StyleConfig:
 
 
 @dataclass(frozen=True)
+class ProtectedConfig:
+    """Paths of the project's own that a contributor's PR may not change.
+
+    Additions to the set Choir protects in every project (workflows, audit
+    policy, the gate's code, the build's manifest and toolchain files), for
+    files that are the overseer's for a reason only the project knows — a
+    plan kept as files in the repo is the case this exists for.
+
+    An entry is a repo-relative path and covers that path and everything
+    under it: a file, or a directory with or without its trailing `/`.
+    There are deliberately no patterns. An entry is compared with the
+    changed paths as text, so it protects the place it spells and nothing
+    else.
+    """
+
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class VerifyConfig:
     """Top-level config for all per-project audit policy knobs."""
 
     axiom_honesty: AxiomHonestyConfig = field(default_factory=AxiomHonestyConfig)
     sorry_delta: SorryDeltaConfig = field(default_factory=SorryDeltaConfig)
     style: StyleConfig = field(default_factory=StyleConfig)
+    protected: ProtectedConfig = field(default_factory=ProtectedConfig)
 
 
 class VerifyConfigError(RuntimeError):
     """Loading or validating `.choir/verify.toml` failed."""
+
+
+def _parse_protected_paths(raw: object) -> tuple[str, ...]:
+    """Validate `[protected] paths`, rejecting the spellings that cannot match.
+
+    Changed paths arrive from GitHub repo-relative, `/`-separated, with no
+    `.` or `..` segments, and they are compared as text. An entry with a
+    leading `/`, an empty, `.` or `..` segment, or a `*` (`/blueprint/`,
+    `./blueprint/`, `blueprint/*.md`) would parse, protect nothing, and look
+    like protection to whoever wrote it — so it is an error here rather than
+    a silent no-op at merge time. That is as far as this goes: a misspelt
+    name or stray whitespace still parses, as the path it spells.
+    """
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise VerifyConfigError("protected.paths must be a list of strings")
+    for entry in raw:
+        segments = entry.removesuffix("/").split("/")
+        if any(seg in ("", ".", "..") for seg in segments) or "*" in entry:
+            raise VerifyConfigError(
+                f"invalid protected.paths entry {entry!r}; each must be a "
+                "repo-relative path, with a trailing '/' for a directory "
+                "(no leading '/', no '.' or '..' segments, no patterns)"
+            )
+    return tuple(raw)
 
 
 def parse_verify_config(text: str) -> VerifyConfig:
@@ -102,7 +158,8 @@ def parse_verify_config(text: str) -> VerifyConfig:
 
     Empty text or no `[audits]` section returns defaults. Unknown
     sections / fields are ignored (forward-compat). Malformed enum
-    values for `policy` raise `VerifyConfigError`.
+    values for `policy` raise `VerifyConfigError`, as does a malformed
+    `[protected]` section.
     """
     try:
         data = tomllib.loads(text)
@@ -162,6 +219,11 @@ def parse_verify_config(text: str) -> VerifyConfig:
             f"audits.style.threshold_lines must be >= 1; got {threshold_raw}"
         )
 
+    pr = data.get("protected", {}) or {}
+    if not isinstance(pr, dict):
+        raise VerifyConfigError("'protected' section must be a table")
+    protected_paths = _parse_protected_paths(pr.get("paths", []))
+
     return VerifyConfig(
         axiom_honesty=AxiomHonestyConfig(
             policy=policy,
@@ -169,6 +231,7 @@ def parse_verify_config(text: str) -> VerifyConfig:
         ),
         sorry_delta=SorryDeltaConfig(policy=sorry_policy),
         style=StyleConfig(threshold_lines=threshold_raw),
+        protected=ProtectedConfig(paths=protected_paths),
     )
 
 

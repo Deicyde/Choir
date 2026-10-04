@@ -29,9 +29,10 @@ gate's daily reconcile workflow.
 
 ### `.choir/verify.toml`
 
-Read by the gate's verify workflows from the PR's **base** commit, never
-the head — so a PR cannot loosen its own audit policy by editing this
-file in the same diff.
+Read from the PR's **base** commit, never the head — so a PR cannot
+loosen its own policy by editing this file in the same diff. The
+`[audits.*]` sections are read by the gate's verify workflows;
+`[protected]` by the orchestrator's merge preflight.
 
 | Key | Accepted values | Default | Effect |
 |---|---|---|---|
@@ -39,6 +40,7 @@ file in the same diff.
 | `[audits.axiom_honesty] allowed_axioms` | list of strings | `[]` | The names permitted under the `whitelist` policy. |
 | `[audits.sorry_delta] policy` | `"block"` \| `"report"` | `block` | `block`: net-new `sorry`s (or the prover's placeholder tokens) fail the check. `report`: net-new placeholders are listed in the check output but the check passes — blueprint-style partial progress can merge on the orchestrator's review, and merged placeholders enter the trust inventory as open obligations. |
 | `[audits.style] threshold_lines` | integer ≥ 1 | `200` | Max lines from a top-level declaration to the next before `verify-style` flags it. Advisory only — see Checks below. |
+| `[protected] paths` | list of repo-relative paths | `[]` | Paths a contributor's PR may not change, added to the set protected in every project (`.github/`, `.choir/`, `gate/` and `pyproject.toml` at the repo root, and every prover's toolchain and manifest files at any depth). An entry covers the path it names and everything under it — a file, or a directory with or without its trailing `/` — anchored at the repo root. No patterns: an entry with a leading `/`, a `.` or `..` segment, or a `*` is rejected, as is a non-list. `choir orch merge` refuses a PR whose changed files include a protected path, and refuses when this file cannot be read or parsed at the base commit; `merge-override` is the overseer's way past, and records the paths. Matching ignores case. Not a gate check — no workflow runs it; but the workflows parse this file, so a malformed `[protected]` puts every audit on its defaults, like any other malformed section. |
 
 ### `.choir/pins.toml`
 

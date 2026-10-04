@@ -70,8 +70,8 @@ covers the second step.
 |---|---|---|
 | Loop clock | `choir orch poll [--once]` | Block until something changes on GitHub, then exit with a JSON diff |
 | Tasks | `choir orch tasks \| task \| create-task \| edit-task` | List, read, and publish Choir task issues; change an open one's pin, plan reference or prose in place |
-| PRs | `choir orch prs \| pr \| pr-diff \| pr-comments` | Open PRs with their check verdicts, diffs, comments |
-| Acting on a PR | `choir orch merge \| close` | Merge (refuses unless green), close |
+| PRs | `choir orch prs \| pr \| pr-diff \| pr-comments` | Open PRs with their check verdicts and the protected paths they touch, diffs, comments |
+| Acting on a PR | `choir orch merge \| close` | Merge (refuses unless green and clear of protected paths), close |
 | Answering | `choir orch comment <n> --body ...` | Leave a comment on a task issue or a PR — one number, either kind |
 | Held workflow runs | `choir orch pending-approvals \| approve-runs` | Fork-PR runs GitHub is holding, and releasing them (§ 1b) |
 | Labels and leases | `choir orch set-priority \| set-difficulty \| sync-leases` | Task metadata, and reconciling lease labels |
@@ -285,9 +285,24 @@ choir orch --repo org/project --prover <id> prs
 
 Each PR comes back with the three verdicts already computed —
 `pending_blocking_checks`, `missing_required_checks`, `blocking_failures`
-— plus `mergeable_now`, true only when all three are empty. **Use those,
-not a check's literal colour.**
+— and `protected_paths`, the changed files `merge` refuses on by path
+(§ Boundaries), plus `mergeable_now`, true only when all four are empty
+and `protected_paths_incomplete` is null. **Use those, not a check's
+literal colour.**
 
+- `protected_paths` non-empty: refuse outright, whatever the checks say —
+  on a PR that edited the gate they are not evidence. Do not approve its
+  held runs either (§ 1b).
+- `protected_paths_incomplete` not null: the list may be missing entries,
+  and the value says why. `prs` sees only a PR's first hundred files; run
+  `pr <n>`, which pages through everything GitHub lists (it lists at most
+  3,000 files for one PR). A `.choir/verify.toml` that could not be
+  read at the PR's base commit is the other reason, and `merge` refuses on
+  it too.
+- `prs` also sees a renamed file under its new path only, and has nothing
+  to flag when that is what it missed: a file moved out of a protected
+  directory shows no protected path there. `pr <n>` lists the old path
+  too, as `merge` does, so it is the complete answer for renames as well.
 - `pending_blocking_checks` non-empty: the gate is still running. Come
   back later.
 - `missing_required_checks` covering *every* check: suspect a held
@@ -323,8 +338,9 @@ The red path is in `orchestrator-review.md`: reading a red
 blocked worker, and salvaging a failed PR by failure type.
 
 **Use these three predicates, not `pr.checks_all_green`.** They read
-`gate/checks.py`, so they give the same answer `merge_pr`'s preflight
-does. `checks_all_green` counts advisory checks too (including, on lean4,
+`gate/checks.py`, so they give the same answer about the checks that
+`merge_pr`'s preflight does. `checks_all_green` counts advisory checks
+too (including, on lean4,
 `statement-equiv`), and `checks_pending` waits out `verify-comparator`'s
 60-minute timeout, so both call a PR red that is already green where it
 matters. **`missing` and `failures` are different diagnoses and deserve
@@ -438,8 +454,11 @@ evidence, not a verdict: the merge is still yours.
   workflows, audit policy, `gate/`, `pyproject.toml`, or a
   toolchain/manifest file, and those files decide which audits run — such
   a PR can be green because it disabled the thing that would have failed
-  it. **Refuse outright** (§ Boundaries). The gate has no protected-paths
-  audit, so this is your check, not a machine's.
+  it. **Refuse outright** (§ Boundaries). `merge` refuses such a PR by
+  path and `pr` lists what it touched under `protected_paths`, but the
+  gate itself has no protected-paths audit, so the checks have not
+  checked this for you — and a path says nothing about what the rest of
+  the diff does.
 
 When the target statement is unchanged from base and the PR is sorry- and
 axiom-clean, the kernel itself rules out hidden assumptions — a helper
@@ -628,12 +647,19 @@ everything after it applies whatever plan you keep.
   files decide *which* audits run at all — `gate/` included, since the
   verify workflows check out the PR's own head tree and run *its* copy of
   `gate/`, so a PR editing a gate module edits the code that audits it.
-  `merge_pr`'s preflight cannot catch this: it checks the names and
-  conclusions of the checks that ran, so a stub job carrying a required
-  name, a gutted `run:` step, or a gate module quietly returning a clean
-  verdict all read as green. Reject and re-publish the clean task; if the
-  change is genuinely needed, it is the overseer's to make on the
-  protected branch.
+  The checks cannot catch this: they are read by name and conclusion, so
+  a stub job carrying a required name, a gutted `run:` step, or a gate
+  module quietly returning a clean verdict all read as green. `merge`'s
+  preflight therefore refuses by path, before it reads a check: a PR
+  whose changed files include any of these, or a path the project lists
+  under `[protected]` in `.choir/verify.toml` (read from the PR's base
+  commit — a plan kept as files in the repo belongs there), does not
+  merge, and the refusal names the paths. A renamed file counts under
+  both its paths. That is the floor, not the review: it knows paths and
+  not content, it runs only when a merge is attempted, and approving a
+  held run (below) comes before that. You still read the diff. Reject and
+  re-publish the clean task; if the change is genuinely needed, it is the
+  overseer's to make on the protected branch.
 - Never merge a PR the gate rejected, and never override the preflight:
   `force` is the overseer's, not yours (§ Automation levels). Never work
   around a red check by pushing fixes into the contributor's branch

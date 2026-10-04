@@ -15,12 +15,22 @@ orchestrator uses — is exempt by design. `merge_pr` therefore enforces the
 gate itself: it refuses any PR whose blocking checks are not green, or whose
 required checks never ran.
 
-What that enforcement does *not* cover: it verifies the checks that ran, by
-name and conclusion, so it cannot detect a PR that changed *which* checks
-run — a stub job carrying a required name, or an existing workflow whose
-`run:` step was gutted, both look green. Closing that needs a protected-paths
-gate audit (the 2026-05-07 decision, still unimplemented). Until then the
-orchestrator refuses any PR touching `.github/` or `.choir/` outright — see
+Reading the checks is not enough on its own. They are verified by name and
+conclusion, so they cannot show that a PR changed *which* checks run — a
+stub job carrying a required name, or an existing workflow whose `run:` step
+was gutted, both look green. `merge_pr` therefore refuses by path first:
+before it reads a single check it refuses any PR whose changed files include
+a protected path (`protected_paths`) — the files that decide which audits
+run, in every project, plus whatever the project lists under `[protected]`
+in `.choir/verify.toml` as the overseer's own.
+
+What that refusal does *not* cover: it knows paths, not content, and it
+lives in this preflight, not in the gate — no workflow runs it, so it binds
+a merge made through `merge_pr` and nothing else. Approving a held workflow
+run happens before any merge is attempted, and a merge pressed in GitHub's
+own interface never reaches this module. The protected-paths gate audit of
+the 2026-05-07 decision is still unimplemented; this is the orchestrator's
+floor until it exists. The orchestrator therefore still reads the diff — see
 `docs/agents/ORCHESTRATOR.md` § Boundaries.
 """
 
@@ -29,9 +39,16 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import asdict, dataclass, replace
+from fnmatch import fnmatchcase
 
 from gate.checks import is_blocking, missing_required
+from gate.provers import PROFILES
 from gate.state.close_on_merge import parse_closing_refs
+from gate.verify.config import (
+    VERIFY_CONFIG_RELATIVE_PATH,
+    VerifyConfigError,
+    parse_verify_config,
+)
 
 
 class PRError(RuntimeError):
@@ -123,13 +140,12 @@ _PR_JSON_FIELDS = (
 
 # `gh pr view --json files` truncates at 100 changed files with no error and
 # no marker — the same cap five gate CLIs were fixed to paginate past. It
-# still matters here: `docs/agents/ORCHESTRATOR.md` § Boundaries has the
-# orchestrator refuse any PR touching `.github/`, and that rule reads
+# still matters here: the protected-path refusal (`protected_paths`) reads
 # `pr.files`. A PR padded past the cap could push its `.github/` edit out of
-# the list the refusal ever sees. `get_pr` therefore paginates; the
-# survey-shaped `list_open_prs` keeps the cheap one-request view and flags
-# `files_truncated` so a caller cannot mistake a truncated list for a
-# complete one.
+# the list the refusal ever sees. `get_pr` therefore reads the paginated REST
+# listing instead; the survey-shaped `list_open_prs` keeps the cheap
+# one-request view and flags `files_truncated` so a caller cannot mistake a
+# truncated list for a complete one.
 _FILES_PAGE_CAP = 100
 
 
@@ -216,15 +232,18 @@ def list_open_prs(repo: str, *, limit: int = 100) -> list[PRView]:
 
 
 def get_pr(repo: str, number: int) -> PRView:
-    """One PR by number (any state), with a complete file list.
+    """One PR by number (any state), with every changed file GitHub lists.
 
     The single-PR read is the one the merge preflight and the stage-two
     review use, so its `files` must be complete: the protected-path refusal
-    in `docs/agents/ORCHESTRATOR.md` § Boundaries reads it, and a PR padded past
-    `gh pr view --json files`'s silent 100-file cap could otherwise push its
-    `.github/` edit out of the list that refusal ever examines. Paginating
-    costs one extra request on a PR of any size, which is the right trade
-    here and the wrong one in `list_open_prs`.
+    (`protected_paths`) reads it. `gh pr view --json files` is incomplete in
+    two ways, both of them a way past that refusal. It stops at 100 files
+    with no marker, so a padded PR could push its `.github/` edit out of the
+    list; and it names a renamed file by its new path only, so a PR could
+    move a file out of a protected directory and show nothing under it. The
+    file list therefore always comes from the REST listing
+    (`_all_changed_files`), on a PR of any size. That is one extra request,
+    which is the right trade here and the wrong one in `list_open_prs`.
     """
     out = _gh(
         "pr", "view", str(number),
@@ -232,22 +251,25 @@ def get_pr(repo: str, number: int) -> PRView:
         "--json", _PR_JSON_FIELDS,
     )
     it = json.loads(out)
-    pr = _parse_pr(it)
-    if not pr.files_truncated:
-        return pr
-    return replace(pr, files=tuple(_all_changed_files(repo, number)),
+    return replace(_parse_pr(it), files=tuple(_all_changed_files(repo, number)),
                    files_truncated=False)
 
 
 def _all_changed_files(repo: str, number: int) -> list[str]:
-    """Every changed path on the PR, paginated past the 100-file cap."""
+    """Every path the PR changes, paginated past the 100-file cap.
+
+    A renamed file contributes both its paths. The old one is where the
+    file stops existing, which is as much a change to that path as an edit:
+    moving `.choir/verify.toml` aside removes the policy, and moving a plan
+    file out of a protected directory deletes it from the plan.
+    """
     out = _gh(
         "api", "--paginate",
         f"repos/{repo}/pulls/{number}/files",
         "-X", "GET", "-f", "per_page=100",
-        "--jq", ".[].filename",
+        "--jq", ".[] | .filename, (.previous_filename // empty)",
     )
-    return [line for line in out.splitlines() if line.strip()]
+    return list(dict.fromkeys(line for line in out.splitlines() if line.strip()))
 
 
 def get_pr_diff(repo: str, number: int) -> str:
@@ -329,6 +351,180 @@ def missing_required_checks(pr: PRView) -> list[str]:
     return missing_required(c.name for c in pr.checks)
 
 
+# The paths `docs/agents/ORCHESTRATOR.md` § Boundaries names, spelled the way
+# `[protected] paths` entries are and matched the same way (`_is_protected`).
+# All are anchored at the repo root, which is where GitHub reads workflows
+# from and where the bootstrap puts `.choir/`, the gate's own code and its
+# `pyproject.toml`.
+_BUILTIN_PROTECTED_PATHS = (".github/", ".choir/", "gate/", "pyproject.toml")
+
+# The toolchain and manifest files, taken from the prover profiles so the
+# worker's primer (`client/workspace.py`) and this refusal cannot name two
+# different sets. Every prover's, not the project's own: this module is
+# called without a prover as readily as with one, and an omitted prover must
+# get the strict answer. A lean4 project has no `ROOT` for a PR to touch, so
+# the union costs nothing where it does not apply.
+_PROVER_PROTECTED_FILES = tuple(
+    sorted({name for profile in PROFILES.values() for name in profile.protected_files})
+)
+
+_PROTECTED_POLICY_QUERY = """\
+query($owner: String!, $name: String!, $oid: GitObjectID!, $expr: String!) {
+  repository(owner: $owner, name: $name) {
+    commit: object(oid: $oid) { oid }
+    file: object(expression: $expr) { ... on Blob { text isTruncated } }
+  }
+}"""
+
+
+@dataclass(frozen=True)
+class ProtectedPaths:
+    """Which protected paths a PR changes, and whether that answer is whole.
+
+    `touched` is every changed path found to be protected. `incomplete` is
+    `None` when `touched` is the full answer, and otherwise says why it may
+    not be — the file list was truncated, or the project's own list could
+    not be read. The two are separate fields because an incomplete answer
+    is not a clean one: a caller that read only `touched` would take "none
+    found" for "none there", which is the fail-open this exists to prevent.
+    `clear` is the one question both the merge and the triage ask.
+    """
+
+    touched: tuple[str, ...]
+    incomplete: str | None = None
+
+    @property
+    def clear(self) -> bool:
+        return not self.touched and self.incomplete is None
+
+
+def _is_protected(path: str, project_paths: tuple[str, ...]) -> bool:
+    # An entry covers the path it names and everything under it, with or
+    # without the trailing slash. A directory written as `blueprint` is the
+    # likeliest slip in a hand-written list, and read as an exact path it
+    # would protect nothing while looking like protection. Nothing is lost
+    # by reading it as both: a path is a file or a directory, never the two.
+    #
+    # Case is folded on both sides. Git keeps `Blueprint/a.md` and
+    # `blueprint/a.md` apart, but a checkout on a case-insensitive
+    # filesystem does not: pulling the first overwrites the second. Refusing
+    # a spelling that would have been harmless elsewhere costs nothing.
+    folded = path.casefold()
+    for entry in (*_BUILTIN_PROTECTED_PATHS, *project_paths):
+        place = entry.rstrip("/").casefold()
+        if folded == place or folded.startswith(place + "/"):
+            return True
+    # A profile's entries are file names, one of them a pattern (`*.opam`),
+    # and they are matched at any depth: an Isabelle session directory
+    # carries its own `ROOT`, and a Lean package nested in the repo its own
+    # lakefile, both as much a part of the build as the one at the root.
+    name = folded.rsplit("/", 1)[-1]
+    return any(
+        fnmatchcase(name, pattern.casefold()) for pattern in _PROVER_PROTECTED_FILES
+    )
+
+
+def _project_protected_paths(repo: str, base_sha: str) -> tuple[str, ...]:
+    """`[protected] paths` from `.choir/verify.toml` at the PR's base commit.
+
+    Read from the base, never the head, for the reason every reader of that
+    file gives: a PR must not be able to loosen the policy it is judged by.
+
+    Read through `gh`, not from a checkout. This module is a thin `gh`
+    wrapper and reads no local config, and that rule is load-bearing here
+    rather than tidy: the overseer's checkout is at whatever commit it was
+    last pulled to, which need not be this PR's base, and `merge_pr` already
+    refuses to trust a PR view it did not fetch itself because a stale view
+    is a bypass. A list handed in by the caller is the same shape — a caller
+    that forgot it would pass nothing and protect nothing, silently. So the
+    function that fetched `pr.base_sha` asks GitHub for the file at exactly
+    that commit.
+
+    One GraphQL read rather than the contents endpoint, because absence has
+    to be told apart from failure. A project with no `.choir/verify.toml`
+    has no paths of its own, which is an answer; a file that could not be
+    fetched is not. The contents endpoint answers 404 for both a missing
+    file and a commit it cannot resolve, and telling them apart there means
+    reading an error string. Here the commit and the file are two fields of
+    one response: a null file under a commit that resolved is absence, and
+    everything else raises.
+
+    Raises `PRError` when the policy cannot be established — `gh` failed,
+    the commit did not resolve, the file is not readable text, or it does
+    not parse. The caller refuses on that; an unreadable policy is not an
+    empty one.
+    """
+    if not base_sha:
+        raise PRError("gh reported no base commit for the PR")
+    owner, _, name = repo.partition("/")
+    try:
+        out = _gh(
+            "api", "graphql",
+            "-f", f"query={_PROTECTED_POLICY_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-f", f"oid={base_sha}",
+            "-f", f"expr={base_sha}:{VERIFY_CONFIG_RELATIVE_PATH.as_posix()}",
+        )
+    except PRError as e:
+        # `_gh` leads its message with the command line it ran, which here is
+        # the whole query. This reason is quoted into the refusal and, on an
+        # override, into a PR comment that stays, so say what `gh` said.
+        failed = e.__cause__
+        if not isinstance(failed, subprocess.CalledProcessError):
+            raise
+        raise PRError(f"gh api graphql failed — {(failed.stderr or '').strip()}") from e
+    try:
+        repository = json.loads(out)["data"]["repository"]
+        commit, file = repository["commit"], repository["file"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise PRError(f"unreadable response from GitHub: {out.strip()!r}") from e
+    if not commit:
+        raise PRError(f"base commit {base_sha} did not resolve in {repo}")
+    if file is None:
+        return ()
+    text = file.get("text")
+    if not isinstance(text, str) or file.get("isTruncated"):
+        raise PRError(f"{VERIFY_CONFIG_RELATIVE_PATH} at {base_sha} is not readable text")
+    try:
+        return parse_verify_config(text).protected.paths
+    except VerifyConfigError as e:
+        raise PRError(f"{VERIFY_CONFIG_RELATIVE_PATH} at {base_sha} is malformed: {e}") from e
+
+
+def protected_paths(repo: str, pr: PRView) -> ProtectedPaths:
+    """The protected paths `pr` changes — the answer `merge_pr` refuses on.
+
+    Protected means: `.github/`, `.choir/`, `gate/`, `pyproject.toml`, every
+    prover profile's toolchain and manifest files, and the project's own
+    `[protected] paths` at the PR's base commit. The first group is not
+    configurable, for the reason the prover profiles are not: those files
+    decide which audits run, and a project that could take one off the list
+    could be talked into it.
+
+    Never raises for a policy it could not read; it reports that in
+    `incomplete` alongside whatever the built-in set already found, because
+    the built-in half of the answer does not depend on the project's file
+    and a caller naming what a PR touched should not lose it. Costs one `gh`
+    request.
+    """
+    reasons: list[str] = []
+    if pr.files_truncated:
+        reasons.append(
+            f"only the first {_FILES_PAGE_CAP} changed files were listed — "
+            "read this PR on its own for the full list"
+        )
+    try:
+        project_paths = _project_protected_paths(repo, pr.base_sha)
+    except PRError as e:
+        project_paths = ()
+        reasons.append(f"the project's `[protected]` paths could not be read — {e}")
+    return ProtectedPaths(
+        touched=tuple(sorted(f for f in pr.files if _is_protected(f, project_paths))),
+        incomplete="; ".join(reasons) or None,
+    )
+
+
 def merge_pr(
     repo: str,
     number: int,
@@ -338,7 +534,8 @@ def merge_pr(
     force: str | None = None,
     prover: str | None = None,
 ) -> None:
-    """Merge the PR, refusing unless every required check is present and green.
+    """Merge the PR, refusing unless it changes no protected path and every
+    required check is present and green.
 
     `prover` is forwarded to `blocking_failures` unchanged (never defaulted
     to a specific prover) — the caller resolves the project's prover once
@@ -350,9 +547,14 @@ def merge_pr(
     unavailable on free private repos, and once spec D4's
     `enforce_admins: false` bootstrap lands the orchestrator runs on the
     owner's auth and the owner is exempt, so GitHub does not constrain this
-    call at any automation level — this check is the enforcement. Its bound:
-    it judges the checks that ran, so it cannot see a PR that changed which
-    checks run (module docstring).
+    call at any automation level — this check is the enforcement.
+
+    Protected paths are refused first, before any check is read
+    (`protected_paths`). The checks are judged by name and conclusion, so on
+    a PR that changed which checks run they are not evidence of anything,
+    and reading them first would report "green" about a gate the PR itself
+    rewrote. A project policy that cannot be read refuses too. The bound of
+    this refusal is in the module docstring: paths, not content.
 
     The PR view is fetched here rather than accepted from the caller: a stale
     view is a bypass. A required check that never ran at all (its workflow
@@ -374,8 +576,10 @@ def merge_pr(
     obvious wrong idiom after seeing this function refuse is `force=True`,
     which would merge silently with no attributable reason, so that and any
     non-string or blank value are rejected outright. The reason, plus
-    whatever it overrode, is posted to the PR before merging, so an override
-    is never silent and remains auditable after the fact — and the override
+    whatever it overrode, is posted to the PR before merging — protected
+    paths the PR changes included, since a change to the gate's own files is
+    the overseer's to make and this is how they make it through a PR — so an
+    override is never silent and remains auditable after the fact — and the override
     path is pinned to `pr.head_sha` too, so the commit that merges is the one
     the trail names. The posted state names the prover the override was
     resolved against: `blocking_failures`/`missing_required_checks` only
@@ -397,8 +601,27 @@ def merge_pr(
         )
 
     pr = get_pr(repo, number)
+    protected = protected_paths(repo, pr)
 
     if force is None:
+        if protected.touched:
+            raise PRError(
+                f"PR #{number} changes protected paths: "
+                f"{', '.join(protected.touched)} — refusing to merge. These "
+                "are the files that decide which audits run, or that the "
+                "project's `[protected]` policy keeps for the overseer, so "
+                "the checks on this PR are not evidence about it. Reject it "
+                "and re-publish the clean task; a change that is genuinely "
+                "needed there is the overseer's to make."
+            )
+        if protected.incomplete:
+            raise PRError(
+                f"PR #{number} could not be checked against the protected "
+                f"paths: {protected.incomplete} — refusing to merge. An "
+                "unreadable policy is not an empty one. Fix "
+                "`.choir/verify.toml` on the protected branch if it is "
+                "malformed; otherwise escalate to the overseer."
+            )
         if not pr.checks:
             raise PRError(
                 f"PR #{number} has no checks — refusing to merge. A repo "
@@ -439,16 +662,22 @@ def merge_pr(
             and c.name not in failures
         )
         overridden: list[str] = []
+        if protected.touched:
+            overridden.append(f"protected paths changed: {', '.join(protected.touched)}")
+        if protected.incomplete:
+            overridden.append(f"protected paths not fully checked: {protected.incomplete}")
+        checks_overridden = bool(missing or failures)
         if missing:
             overridden.append(f"missing entirely: {', '.join(missing)}")
         if failures:
             overridden.append(f"failing: {', '.join(sorted(failures))}")
         basis = f"prover={prover!r}" if prover is not None else "no prover given (strict)"
-        state = (
-            "; ".join(overridden)
-            if overridden
-            else f"all required checks were green (resolved for {basis})"
-        )
+        # Said even when something else was overridden: a PR merged past the
+        # protected-path refusal alone had a green gate, and the trail should
+        # not leave a reader to infer that from the absence of a clause.
+        if not checks_overridden:
+            overridden.append(f"all required checks were green (resolved for {basis})")
+        state = "; ".join(overridden)
         if non_blocking_red:
             state += (
                 f"; non-blocking red under that resolution: "

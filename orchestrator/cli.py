@@ -57,6 +57,7 @@ from orchestrator.prs import (
     missing_required_checks,
     pending_blocking_checks,
     post_comment,
+    protected_paths,
 )
 from orchestrator.runs import approve_runs_for_sha, pending_approvals
 from orchestrator.salvage import classify_failure, create_salvage_task
@@ -99,25 +100,44 @@ def _c_lease(a: argparse.Namespace) -> int:
 
 
 def _c_prs(a: argparse.Namespace) -> int:
-    return _emit([_pr_payload(pr, a.prover) for pr in list_open_prs(a.repo, limit=a.limit)])
+    return _emit([
+        _pr_payload(a.repo, pr, a.prover) for pr in list_open_prs(a.repo, limit=a.limit)
+    ])
 
 
-def _pr_payload(pr: Any, prover: str | None) -> dict[str, Any]:
+def _pr_payload(repo: str, pr: Any, prover: str | None) -> dict[str, Any]:
     """A PR plus the three verdicts the playbook says to read instead of
     `checks_all_green` — computed here so the caller cannot use the wrong
-    predicate (`ORCHESTRATOR.md` § Review open PRs)."""
+    predicate (`ORCHESTRATOR.md` § Review open PRs).
+
+    `protected_paths` is the other thing `merge` refuses on, asked the same
+    way `merge_pr` asks it so triage and merge agree. It comes with
+    `protected_paths_incomplete`: `null` when the list is the whole answer,
+    otherwise why it may not be — `prs` sees only a PR's first hundred
+    files, and a project policy can fail to read. An incomplete answer holds
+    `mergeable_now` false like a found path does: "none found" is not "none
+    there", and `pr <n>` reads the full file list when `prs` could not.
+
+    `pr <n>` is the complete answer for renames as well. `prs` gets a
+    renamed file under its new path only, with no marker to flag, so a file
+    moved out of a protected directory is invisible there; `pr <n>` and
+    `merge` read the old path too.
+    """
     d = _plain(pr)
     d["blocking_failures"] = blocking_failures(pr, prover=prover)
     d["missing_required_checks"] = missing_required_checks(pr)
     d["pending_blocking_checks"] = pending_blocking_checks(pr, prover=prover)
-    d["mergeable_now"] = not (
+    protected = protected_paths(repo, pr)
+    d["protected_paths"] = list(protected.touched)
+    d["protected_paths_incomplete"] = protected.incomplete
+    d["mergeable_now"] = protected.clear and not (
         d["blocking_failures"] or d["missing_required_checks"] or d["pending_blocking_checks"]
     )
     return d
 
 
 def _c_pr(a: argparse.Namespace) -> int:
-    return _emit(_pr_payload(get_pr(a.repo, a.number), a.prover))
+    return _emit(_pr_payload(a.repo, get_pr(a.repo, a.number), a.prover))
 
 
 def _c_pr_diff(a: argparse.Namespace) -> int:
@@ -570,13 +590,15 @@ def _add_write_commands(add) -> None:  # type: ignore[no-untyped-def]
     """The mutating half. `merge` and `merge-override` are separate
     subcommands so that a permission rule granting one does not grant the
     other — see the module docstring."""
-    s = add("merge", _c_merge, "merge a PR — refuses unless the gate is green")
+    s = add("merge", _c_merge,
+            "merge a PR — refuses unless the gate is green and no protected path changed")
     _add_number(s, "--pr")
     s.add_argument("--method", choices=["squash", "merge", "rebase"], default="squash")
     s.add_argument("--keep-branch", action="store_true")
 
     s = add("merge-override", _c_merge_override,
-            "OVERSEER ONLY: merge past a red gate, with an attributable reason")
+            "OVERSEER ONLY: merge past a red gate or a protected path, with an "
+            "attributable reason")
     _add_number(s, "--pr")
     s.add_argument("--reason", required=True,
                    help="why the override is justified; posted to the PR before merging")

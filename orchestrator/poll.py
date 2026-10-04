@@ -80,6 +80,10 @@ def _checks_state(pr: PRView, *, prover: str | None = None) -> str:
     absent — see `gate.checks.REQUIRED_PRESENT`'s docstring), so there is
     nothing for a keyword to mean there.
 
+    Only the checks, though: "green" here is not `mergeable_now`. The
+    preflight's protected-path refusal costs a request per PR, so it is left
+    to `choir orch prs`, which the orchestrator reads once it is awake.
+
     Trade-off, accepted: an advisory check finishing *after* the blocking set
     goes green produces no state transition, so no wakeup. The orchestrator
     reads the full PR when it acts on the green, and can see there that an
