@@ -26,6 +26,7 @@ from orchestrator.tasks.api import (
     create_task_issue,
     get_task,
     list_choir_tasks,
+    open_task_for_decl,
 )
 from orchestrator.tasks.serialize import (
     body_to_task,
@@ -40,5 +41,6 @@ __all__ = [
     "create_task_issue",
     "get_task",
     "list_choir_tasks",
+    "open_task_for_decl",
     "task_to_body",
 ]

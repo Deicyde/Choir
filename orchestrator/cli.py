@@ -65,6 +65,7 @@ from orchestrator.tasks import (
     create_task_issue,
     get_task,
     list_choir_tasks,
+    open_task_for_decl,
 )
 from viz.report import DEFAULT_NAME as _VIZ_NAME
 from viz.report import ReportError
@@ -172,7 +173,16 @@ def _c_project_config(a: argparse.Namespace) -> int:
 
 def _c_create_task(a: argparse.Namespace) -> int:
     """Publish one task issue. The body round-trips through the gate's
-    intake parser, so a task this creates is one a worker can claim."""
+    intake parser, so a task this creates is one a worker can claim.
+
+    Refuses a declaration that already has an open task. A publish step
+    gets re-run, and a plan gets reorganised under ids that no longer match
+    the ones already published; either way the second issue splits workers
+    across one proof. A search that could not see every open task refuses
+    too: creating on "none found among the first thousand" is the silent
+    duplicate this check exists to stop. `--allow-duplicate` skips the
+    search, for the deliberate second task and for a board past the limit.
+    """
     record = TaskRecord(
         choir_task_version=1,
         type=TaskType(a.type),
@@ -182,6 +192,24 @@ def _c_create_task(a: argparse.Namespace) -> int:
         deps=list(a.dep),
         blueprint_ref=a.blueprint_ref,
     )
+    if not a.allow_duplicate:
+        where = f"{record.target_decl} in {record.target_file}"
+        existing, saw_all = open_task_for_decl(
+            a.repo, record.target_file, record.target_decl)
+        if existing is not None:
+            return _emit({
+                "created": False, "number": existing.number,
+                "refused": f"#{existing.number} is already open for {where}; "
+                           "pass --allow-duplicate to publish a second task "
+                           "for it.",
+            })
+        if not saw_all:
+            return _emit({
+                "created": False,
+                "refused": "the listing of open tasks came back full, so one "
+                           f"for {where} may lie past its end; pass "
+                           "--allow-duplicate to publish without the check.",
+            })
     number = create_task_issue(
         a.repo, task=record, title=a.title, prose=a.prose,
         extra_labels=tuple(a.label),
@@ -486,18 +514,7 @@ def _add_write_commands(add) -> None:  # type: ignore[no-untyped-def]
     s.add_argument("--method", choices=["squash", "merge", "rebase"], default="squash")
     s.add_argument("--keep-branch", action="store_true")
 
-    s = add("create-task", _c_create_task, "publish one task issue")
-    s.add_argument("--title", required=True)
-    s.add_argument("--target-file", required=True)
-    s.add_argument("--target-decl", required=True)
-    s.add_argument("--commit", required=True, help="project_ref commit the task pins")
-    s.add_argument("--toolchain", required=True, help="project_ref toolchain")
-    s.add_argument("--type", choices=["prove", "golf", "index"], default="prove")
-    s.add_argument("--dep", type=int, action="append", default=[],
-                   help="issue number this task was decomposed from (repeatable)")
-    s.add_argument("--blueprint-ref", default=None, help="the plan node this fills")
-    s.add_argument("--prose", default="", help="statement context, hints, references")
-    s.add_argument("--label", action="append", default=[], help="extra label (repeatable)")
+    _add_task_commands(add)
 
     for name, fn, help_ in (
         ("metrics", _c_metrics, "per-task lifecycle data (forwards to orchestrator.metrics)"),
@@ -543,6 +560,25 @@ def _add_write_commands(add) -> None:  # type: ignore[no-untyped-def]
     s.add_argument("--stale-after-hours", type=int, default=24)
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--limit", type=int, default=200)
+
+
+def _add_task_commands(add) -> None:  # type: ignore[no-untyped-def]
+    """The commands that write a task issue's body."""
+    s = add("create-task", _c_create_task,
+            "publish one task issue — refuses a declaration that has an open one")
+    s.add_argument("--title", required=True)
+    s.add_argument("--target-file", required=True)
+    s.add_argument("--target-decl", required=True)
+    s.add_argument("--commit", required=True, help="project_ref commit the task pins")
+    s.add_argument("--toolchain", required=True, help="project_ref toolchain")
+    s.add_argument("--type", choices=["prove", "golf", "index"], default="prove")
+    s.add_argument("--dep", type=int, action="append", default=[],
+                   help="issue number this task was decomposed from (repeatable)")
+    s.add_argument("--blueprint-ref", default=None, help="the plan node this fills")
+    s.add_argument("--prose", default="", help="statement context, hints, references")
+    s.add_argument("--label", action="append", default=[], help="extra label (repeatable)")
+    s.add_argument("--allow-duplicate", action="store_true",
+                   help="publish even if the declaration already has an open task")
 
 
 def main(argv: list[str] | None = None) -> int:

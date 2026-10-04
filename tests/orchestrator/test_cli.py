@@ -20,8 +20,11 @@ import json
 
 import pytest
 
+from gate.state.task_record import ProjectRef, TaskRecord, TaskType
 from orchestrator import cli as cli_mod
 from orchestrator.prs import PRError
+from orchestrator.tasks import api as tasks_api
+from orchestrator.tasks.serialize import task_to_body
 
 
 def _pr(number: int = 7) -> object:
@@ -188,3 +191,113 @@ def test_a_second_positional_still_binds_when_the_number_is_optional(
 
     assert cli_mod.main(argv) == 0
     assert json.loads(capsys.readouterr().out) == {"number": 7, "priority": "HIGH"}
+
+
+# ------------------------------------------------- one task per declaration
+#
+# `create-task` is the only thing standing between a re-run publish step and
+# two issues for one proof, so these run the command against a board rather
+# than against a stubbed lookup.
+
+
+def _task_body(decl: str = "Sample.foo", *, file: str = "Sample/Foo.lean",
+               blueprint_ref: str | None = None, prose: str = "") -> str:
+    return task_to_body(TaskRecord(
+        choir_task_version=1, type=TaskType.PROVE,
+        target_file=file, target_decl=decl,
+        project_ref=ProjectRef(repo="o/r", commit="a" * 40,
+                               toolchain="leanprover/lean4:v4.34.0"),
+        deps=[], blueprint_ref=blueprint_ref,
+    ), prose)
+
+
+class _Board:
+    """A repo's issues, answering the `gh` calls the task commands make."""
+
+    def __init__(self, *issues: dict[str, object]) -> None:
+        self.issues = [
+            {"title": "t", "url": "u", "state": "OPEN",
+             "labels": [{"name": "choir/task"}], **issue}
+            for issue in issues
+        ]
+        self.created: list[str] = []
+
+    def __call__(self, *args: str) -> str:
+        def opt(flag: str) -> str:
+            return args[args.index(flag) + 1]
+
+        if args[:2] == ("issue", "list"):
+            state = opt("--state")
+            shown = [i for i in self.issues
+                     if state == "all" or str(i["state"]).lower() == state]
+            return json.dumps(shown[: int(opt("--limit"))])
+        if args[:2] == ("issue", "create"):
+            self.created.append(opt("--body"))
+            return "https://github.com/o/r/issues/99\n"
+        raise AssertionError(f"unexpected gh call: {args}")
+
+
+_CREATE = ["--repo", "o/r", "create-task", "--title", "prove foo",
+           "--target-file", "Sample/Foo.lean", "--target-decl", "Sample.foo",
+           "--commit", "b" * 40, "--toolchain", "leanprover/lean4:v4.34.0"]
+
+
+def test_create_task_refuses_a_declaration_that_has_an_open_task(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The existing task was published under another plan id, which is the
+    case a check on `blueprint_ref` would wave through."""
+    board = _Board({"number": 12, "body": _task_body(blueprint_ref="old-id")})
+    monkeypatch.setattr(tasks_api, "_gh", board)
+
+    rc = cli_mod.main([*_CREATE, "--blueprint-ref", "new-id"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["created"] is False
+    assert payload["number"] == 12
+    assert payload["refused"]
+    assert board.created == []
+
+
+@pytest.mark.parametrize("issue", [
+    {"number": 12, "body": _task_body(), "state": "CLOSED"},
+    {"number": 12, "body": _task_body("Sample.bar")},
+    {"number": 12, "body": _task_body(file="Sample/Bar.lean")},
+])
+def test_create_task_publishes_when_no_open_task_has_the_decl(issue, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """A closed task is finished or retired, and another declaration in the
+    same file is other work. So is the same name in another file: where a
+    prover's names are file-local, that is a different proof. None of them
+    is a reason to hold a task back."""
+    board = _Board(issue)
+    monkeypatch.setattr(tasks_api, "_gh", board)
+
+    assert cli_mod.main(_CREATE) == 0
+
+    assert json.loads(capsys.readouterr().out)["created"] is True
+    assert len(board.created) == 1
+
+
+def test_allow_duplicate_publishes_past_an_open_task(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    board = _Board({"number": 12, "body": _task_body()})
+    monkeypatch.setattr(tasks_api, "_gh", board)
+
+    assert cli_mod.main([*_CREATE, "--allow-duplicate"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "created": True, "number": 99, "title": "prove foo"}
+    assert len(board.created) == 1
+
+
+def test_create_task_refuses_when_the_open_tasks_could_not_all_be_read(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Publishing on a search that stopped at the listing limit is how a
+    duplicate would get through unannounced."""
+    board = _Board()
+    monkeypatch.setattr(tasks_api, "_gh", board)
+    monkeypatch.setattr(cli_mod, "open_task_for_decl", lambda repo, file, decl: (None, False))
+
+    assert cli_mod.main(_CREATE) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["created"] is False
+    assert "number" not in payload
+    assert board.created == []

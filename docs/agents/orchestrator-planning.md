@@ -196,7 +196,9 @@ stated, is yours to write: commit the declaration with a placeholder body
 before publishing anything against it.
 
 The node's `file` and `decl` are the task's `target_file` and
-`target_decl`; set `blueprint_ref` to the node's id.
+`target_decl`; set `blueprint_ref` to the node's id. `create-task` keeps
+node and task one to one from its side: it refuses a `target_file` and
+`target_decl` that already have an open task.
 
 Keep a node's dependencies out of the task's `deps`, which holds issue
 numbers and records which task this one was split out of.

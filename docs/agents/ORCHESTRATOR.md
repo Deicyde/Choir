@@ -483,6 +483,16 @@ choir orch --repo org/project create-task \
 `--dep` is provenance (decomposed from #42) and repeats; `--blueprint-ref`
 names the plan node this task fills.
 
+`create-task` refuses a declaration that already has an open task: it
+creates nothing and answers `{"created": false, "number": …, "refused": …}`
+with the existing issue's number, so re-running a publish step is safe. The
+match is on `--target-file` and `--target-decl` together, not on
+`--blueprint-ref`, so a node renamed in the plan is still caught and a
+declaration moved to another file is not. Once the project has 1000 open
+tasks, the most one listing returns, a search that finds no match among
+them refuses with no number, because a duplicate past the listing's end
+would go unseen. `--allow-duplicate` publishes regardless.
+
 **Publish only tasks that are ready to work on.** An available issue must
 be genuinely available, so a blocked node stays in the plan and never
 becomes an issue. `deps` is provenance metadata — workers get a soft

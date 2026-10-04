@@ -1,11 +1,12 @@
 """Public API for maintainer-side operations on a Choir project repo.
 
-Three primitives:
+The primitives:
 
-- :func:`create_task_issue` — create one issue from a TaskRecord
-- :func:`list_choir_tasks`  — enumerate existing Choir issues
-- :func:`get_task`          — read one issue back as a TaskRecord
-- :func:`set_task_pin`      — move one issue's pinned commit
+- :func:`create_task_issue`  — create one issue from a TaskRecord
+- :func:`list_choir_tasks`   — enumerate existing Choir issues
+- :func:`open_task_for_decl` — the open task a declaration already has
+- :func:`get_task`           — read one issue back as a TaskRecord
+- :func:`set_task_pin`       — move one issue's pinned commit
 
 These are intentionally low-level. Composing them (batch-creating
 issues for a benchmark, building a leaderboard, polling status) is
@@ -213,6 +214,48 @@ def list_choir_tasks(
             )
         )
     return handles
+
+
+def open_task_for_decl(
+    repo: str, target_file: str, target_decl: str, *, limit: int = 1000
+) -> tuple[TaskHandle | None, bool]:
+    """The open task already targeting `target_decl` in `target_file`, and
+    whether every open task was seen.
+
+    The join is on the declaration, not on `blueprint_ref`. A plan node's
+    id changes when the plan is reorganised; the declaration is what the
+    task is for, so it is the key that survives the plan being renamed
+    around it.
+
+    A declaration is the file and the name together, the pair the gate
+    resolves. The name alone identifies it only where names are fully
+    qualified. A Rocq or Isabelle task carries the short name its file
+    declares, so two files can each hold a `helper`, and those are two
+    proofs. `target_file` is compared as a `TaskRecord` holds it, which is
+    already normalised.
+
+    Only open tasks count. A closed task is finished or retired, and
+    publishing its declaration again — after a revert, or for a golf — is
+    ordinary. An issue whose body fails the intake parse targets nothing
+    and is skipped: no worker can claim it either.
+
+    The second value is the honest half of a `None`. `gh` returns at most
+    `limit` issues, so a listing that comes back full may have a duplicate
+    past its end; `False` says "none among those listed", which is not
+    "none". It is the caller's to decide what an unfinished search permits.
+
+    With several matches the lowest number is returned: the oldest task is
+    the one a worker is likeliest to hold.
+    """
+    handles = list_choir_tasks(repo, state="open", limit=limit)
+    matches = [
+        h for h in handles
+        if h.record is not None
+        and (h.record.target_file, h.record.target_decl) == (target_file, target_decl)
+    ]
+    if matches:
+        return min(matches, key=lambda h: h.number), True
+    return None, len(handles) < limit
 
 
 def get_task(repo: str, number: int) -> TaskView:

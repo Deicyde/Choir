@@ -21,6 +21,7 @@ from orchestrator.tasks.api import (
     create_task_issue,
     get_task,
     list_choir_tasks,
+    open_task_for_decl,
     set_task_pin,
 )
 from orchestrator.tasks.serialize import body_to_task, task_to_body
@@ -153,6 +154,53 @@ def test_list_passes_task_type_label_filter(monkeypatch) -> None:  # type: ignor
     label_args = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--label"]
     assert "choir/type:prove" in label_args
     assert "benchmark/foo" in label_args
+
+
+# ---------------------------------------------------------------------------
+# open_task_for_decl
+# ---------------------------------------------------------------------------
+
+
+def _listed(number: int, body: str) -> dict[str, object]:
+    return {"number": number, "title": f"t{number}", "url": f"https://x/{number}",
+            "state": "OPEN", "labels": [{"name": "choir/task"}], "body": body}
+
+
+def test_open_task_for_decl_finds_the_oldest_task_on_the_declaration(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The join is the declaration, file and name: a different plan
+    reference on the same declaration is still the same work, and the same
+    name in another file is other work. An unparsable issue targets nothing,
+    so it neither matches nor stops the search."""
+    file = _record().target_file
+    renamed = _record().model_copy(update={"blueprint_ref": "old-node-id"})
+    other = _record().model_copy(update={"target_decl": "Sample.bar"})
+    elsewhere = _record().model_copy(update={"target_file": "Other/Foo.lean"})
+    payload = json.dumps([
+        _listed(9, task_to_body(_record())),
+        _listed(8, "not a task body"),
+        _listed(5, task_to_body(other)),
+        _listed(3, task_to_body(renamed)),
+        _listed(2, task_to_body(elsewhere)),
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeProc(stdout=payload))
+
+    found, saw_all = open_task_for_decl("alice/proj", file, "Sample.foo")
+
+    assert found is not None and found.number == 3
+    assert saw_all
+    assert open_task_for_decl("alice/proj", file, "Sample.baz") == (None, True)
+
+
+def test_open_task_for_decl_does_not_call_a_full_listing_a_clean_search(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A listing that fills its limit may have been cut short, and the task
+    being looked for may be in the part that was cut."""
+    file = _record().target_file
+    other = _record().model_copy(update={"target_decl": "Sample.bar"})
+    payload = json.dumps([_listed(n, task_to_body(other)) for n in (1, 2)])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeProc(stdout=payload))
+
+    assert open_task_for_decl("alice/proj", file, "Sample.foo", limit=2) == (None, False)
+    assert open_task_for_decl("alice/proj", file, "Sample.foo", limit=3) == (None, True)
 
 
 # ---------------------------------------------------------------------------
