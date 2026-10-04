@@ -121,8 +121,14 @@ def read_lease(
     latest = max(theirs, key=lambda c: c.id, default=None)
     quiet = None
     if latest is not None:
-        seen = datetime.fromisoformat(latest.updated_at.replace("Z", "+00:00"))
-        quiet = round((moment - seen).total_seconds() / 3600, 1)
+        try:
+            seen = datetime.fromisoformat(latest.updated_at.replace("Z", "+00:00"))
+            quiet = round((moment - seen).total_seconds() / 3600, 1)
+        except ValueError:
+            # `decide_lease` counts a stamp it cannot parse as fresh, so
+            # this is a holder. How long they have been quiet is unknown,
+            # and that must not cost the caller the holder's name.
+            quiet = None
     return LeaseState(
         number=number,
         holder=decision.holder,

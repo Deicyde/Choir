@@ -138,6 +138,20 @@ def test_reading_a_lease_reports_the_holder_and_how_long_they_have_been_quiet(
     assert state.stale_after_hours == 24
 
 
+def test_a_holder_whose_stamp_cannot_be_read_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The arbiter counts a stamp it cannot parse as fresh, so this claimant
+    holds the task. Reading the lease has to say so rather than fail on the
+    same stamp: the holder is the answer, the quiet time is what is unknown."""
+    monkeypatch.setattr(
+        leases, "read_lease_comments", _fake_comments({7: [(1, "alice", "claim", "garbled")]})
+    )
+    state = read_lease("o/r", 7, now=NOW)
+    assert state.holder == "alice"
+    assert state.quiet_hours is None
+
+
 def test_a_heartbeat_is_what_freshness_is_read_from(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
